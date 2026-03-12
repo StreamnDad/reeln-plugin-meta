@@ -1,8 +1,9 @@
-"""Shared test fixtures for the plugin."""
+"""Shared test fixtures for reeln-plugin-meta."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,6 +30,18 @@ def game_info() -> FakeGameInfo:
 
 
 @pytest.fixture()
-def plugin_config() -> dict[str, Any]:
+def token_file(tmp_path: Path) -> Path:
+    """Return a temporary token file with a valid token."""
+    token = tmp_path / "page_token.txt"
+    token.write_text("test-access-token-123")
+    return token
+
+
+@pytest.fixture()
+def plugin_config(token_file: Path) -> dict[str, Any]:
     """Return a minimal valid plugin config."""
-    return {}
+    return {
+        "page_access_token_file": str(token_file),
+        "page_id": "123456789",
+        "create_livestream": True,
+    }
