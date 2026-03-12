@@ -12,6 +12,7 @@ from reeln_meta_plugin.livestream import (
     LivestreamError,
     LivestreamResult,
     create_livestream,
+    update_livestream,
 )
 
 
@@ -164,3 +165,89 @@ class TestCreateLivestream:
             pytest.raises(LivestreamError, match="HTTP 500"),
         ):
             create_livestream(page_id="p", access_token="t", title="T")
+
+
+class TestUpdateLivestream:
+    def test_updates_title(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post", return_value={}) as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                title="New Title",
+            )
+
+        url, payload = mock_post.call_args[0]
+        assert "live-123" in url
+        assert payload["title"] == "New Title"
+        assert "description" not in payload
+
+    def test_updates_description(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post", return_value={}) as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                description="New Desc",
+            )
+
+        _, payload = mock_post.call_args[0]
+        assert payload["description"] == "New Desc"
+        assert "title" not in payload
+
+    def test_updates_both(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post", return_value={}) as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                title="T",
+                description="D",
+            )
+
+        _, payload = mock_post.call_args[0]
+        assert payload["title"] == "T"
+        assert payload["description"] == "D"
+
+    def test_custom_api_version(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post", return_value={}) as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                title="T",
+                api_version="v23.0",
+            )
+
+        url, _ = mock_post.call_args[0]
+        assert "v23.0" in url
+
+    def test_skips_when_no_fields(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post") as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+            )
+
+        mock_post.assert_not_called()
+
+    def test_skips_when_empty_strings(self) -> None:
+        with patch("reeln_meta_plugin.livestream.http_post") as mock_post:
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                title="",
+                description="",
+            )
+
+        mock_post.assert_not_called()
+
+    def test_graph_api_error_wrapped(self) -> None:
+        with (
+            patch(
+                "reeln_meta_plugin.livestream.http_post",
+                side_effect=GraphAPIError("HTTP 400: bad request"),
+            ),
+            pytest.raises(LivestreamError, match="HTTP 400"),
+        ):
+            update_livestream(
+                live_video_id="live-123",
+                access_token="tok",
+                title="T",
+            )

@@ -91,3 +91,40 @@ def create_livestream(
 
     embed_url = f"https://www.facebook.com/{page_id}/videos/{live_id}"
     return LivestreamResult(id=live_id, stream_url=stream_url, embed_url=embed_url)
+
+
+def update_livestream(
+    *,
+    live_video_id: str,
+    access_token: str,
+    title: str = "",
+    description: str = "",
+    api_version: str = "v24.0",
+) -> None:
+    """Update metadata on an existing Facebook Live Video.
+
+    Args:
+        live_video_id: The live video ID to update.
+        access_token: Page Access Token.
+        title: New title (skipped if empty).
+        description: New description (skipped if empty).
+        api_version: Graph API version.
+
+    Raises:
+        LivestreamError: If the API call fails.
+    """
+    url = f"https://graph.facebook.com/{api_version}/{live_video_id}"
+    payload: dict[str, str] = {"access_token": access_token}
+
+    if title:
+        payload["title"] = title
+    if description:
+        payload["description"] = description
+
+    if len(payload) == 1:
+        return
+
+    try:
+        http_post(url, payload)
+    except GraphAPIError as exc:
+        raise LivestreamError(str(exc)) from exc

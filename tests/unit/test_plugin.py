@@ -24,7 +24,7 @@ class TestMetaPluginAttributes:
 
     def test_version(self) -> None:
         plugin = MetaPlugin()
-        assert plugin.version == "0.4.0"
+        assert plugin.version == "0.5.0"
 
     def test_api_version(self) -> None:
         plugin = MetaPlugin()
@@ -117,6 +117,7 @@ class TestMetaPluginInit:
         assert plugin._config == {}
         assert plugin._access_token is None
         assert plugin._game_info is None
+        assert plugin._livestream_id is None
 
     def test_empty_config(self) -> None:
         plugin = MetaPlugin({})
@@ -133,6 +134,12 @@ class TestMetaPluginRegister:
         registry = HookRegistry()
         plugin.register(registry)
         assert registry.has_handlers(Hook.ON_GAME_INIT)
+
+    def test_registers_on_game_ready(self) -> None:
+        plugin = MetaPlugin()
+        registry = HookRegistry()
+        plugin.register(registry)
+        assert registry.has_handlers(Hook.ON_GAME_READY)
 
     def test_registers_on_game_finish(self) -> None:
         plugin = MetaPlugin()
@@ -259,6 +266,19 @@ class TestOnGameInit:
             plugin.on_game_init(context)
 
         assert context.shared["livestreams"]["meta"] == _FAKE_RESULT.embed_url
+
+    def test_caches_livestream_id(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        game_info = FakeGameInfo()
+        context = HookContext(hook=Hook.ON_GAME_INIT, data={"game_info": game_info})
+
+        with patch(
+            "reeln_meta_plugin.plugin.livestream.create_livestream",
+            return_value=_FAKE_RESULT,
+        ):
+            plugin.on_game_init(context)
+
+        assert plugin._livestream_id == "live-123"
 
     def test_caches_game_info(self, plugin_config: dict[str, Any]) -> None:
         plugin = MetaPlugin(plugin_config)
@@ -527,6 +547,221 @@ class TestOnGameInitDryRun:
         mock_create.assert_called_once()
 
 
+class TestOnGameReady:
+    def _ready_plugin(self, plugin_config: dict[str, Any]) -> MetaPlugin:
+        """Return a plugin with cached state as if on_game_init already ran."""
+        plugin = MetaPlugin(plugin_config)
+        plugin._livestream_id = "live-123"
+        plugin._access_token = "test-access-token-123"
+        return plugin
+
+    def test_skips_when_no_livestream_id(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "New Title"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_skips_when_no_metadata(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(hook=Hook.ON_GAME_READY, data={})
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_skips_when_metadata_empty(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_skips_when_title_and_description_empty(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "", "description": ""}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_skips_when_auth_fails(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        plugin._livestream_id = "live-123"
+        # No _access_token set, and mock auth to fail
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "New Title"}},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.auth.read_token",
+                side_effect=AuthError("bad token"),
+            ),
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_updates_with_title(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "Updated Title"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_called_once_with(
+            live_video_id="live-123",
+            access_token="test-access-token-123",
+            title="Updated Title",
+            description="",
+            api_version="v24.0",
+        )
+
+    def test_updates_with_description(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"description": "Game day description"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_called_once_with(
+            live_video_id="live-123",
+            access_token="test-access-token-123",
+            title="",
+            description="Game day description",
+            api_version="v24.0",
+        )
+
+    def test_updates_with_both(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T", "description": "D"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        kwargs = mock_update.call_args[1]
+        assert kwargs["title"] == "T"
+        assert kwargs["description"] == "D"
+
+    def test_custom_api_version(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config["graph_api_version"] = "v23.0"
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        assert mock_update.call_args[1]["api_version"] == "v23.0"
+
+    def test_update_error_logs_warning(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T"}},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.livestream.update_livestream",
+                side_effect=LivestreamError("api error"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_game_ready(context)
+
+        assert "livestream update failed" in caplog.text
+
+    def test_logs_info_on_success(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T"}},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream"),
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_game_ready(context)
+
+        assert "updated livestream" in caplog.text
+
+    def test_dry_run_skips_update(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config["dry_run"] = True
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+
+    def test_dry_run_logs_info(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin_config["dry_run"] = True
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "T"}},
+        )
+
+        with caplog.at_level(logging.INFO):
+            plugin.on_game_ready(context)
+
+        assert "DRY RUN" in caplog.text
+        assert "would update livestream" in caplog.text
+
+
 class TestOnGameFinish:
     def test_resets_access_token(self, plugin_config: dict[str, Any]) -> None:
         plugin = MetaPlugin(plugin_config)
@@ -546,6 +781,15 @@ class TestOnGameFinish:
 
         assert plugin._game_info is None
 
+    def test_resets_livestream_id(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        plugin._livestream_id = "live-123"
+        context = HookContext(hook=Hook.ON_GAME_FINISH, data={})
+
+        plugin.on_game_finish(context)
+
+        assert plugin._livestream_id is None
+
     def test_allows_re_auth_after_reset(self, plugin_config: dict[str, Any]) -> None:
         """After on_game_finish, _ensure_auth reads the token again."""
         plugin = MetaPlugin(plugin_config)
@@ -563,26 +807,44 @@ class TestOnGameFinish:
 
 class TestIntegrationWithRegistry:
     def test_full_lifecycle(self, plugin_config: dict[str, Any]) -> None:
-        """Simulate the full plugin lifecycle: init -> register -> emit init -> emit finish."""
+        """Simulate the full plugin lifecycle: init -> ready -> finish."""
         plugin = MetaPlugin(plugin_config)
         registry = HookRegistry()
         plugin.register(registry)
 
+        # ON_GAME_INIT — create livestream
         game_info = FakeGameInfo(home_team="Storm", away_team="Thunder")
-        context = HookContext(hook=Hook.ON_GAME_INIT, data={"game_info": game_info})
+        init_context = HookContext(hook=Hook.ON_GAME_INIT, data={"game_info": game_info})
 
         with patch(
             "reeln_meta_plugin.plugin.livestream.create_livestream",
             return_value=_FAKE_RESULT,
         ):
-            registry.emit(Hook.ON_GAME_INIT, context)
+            registry.emit(Hook.ON_GAME_INIT, init_context)
 
-        assert context.shared["livestreams"]["meta"] == _FAKE_RESULT.embed_url
+        assert init_context.shared["livestreams"]["meta"] == _FAKE_RESULT.embed_url
         assert plugin._game_info is game_info
         assert plugin._access_token is not None
+        assert plugin._livestream_id == "live-123"
 
+        # ON_GAME_READY — update metadata
+        ready_context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"livestream_metadata": {"title": "Storm vs Thunder - Updated"}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+            registry.emit(Hook.ON_GAME_READY, ready_context)
+
+        mock_update.assert_called_once()
+        assert mock_update.call_args[1]["live_video_id"] == "live-123"
+        assert mock_update.call_args[1]["title"] == "Storm vs Thunder - Updated"
+
+        # ON_GAME_FINISH — reset state
         finish_context = HookContext(hook=Hook.ON_GAME_FINISH, data={})
         registry.emit(Hook.ON_GAME_FINISH, finish_context)
 
         assert plugin._access_token is None
         assert plugin._game_info is None
+        assert plugin._livestream_id is None

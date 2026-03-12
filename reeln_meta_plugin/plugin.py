@@ -23,7 +23,7 @@ class MetaPlugin:
     """
 
     name: str = "meta"
-    version: str = "0.4.0"
+    version: str = "0.5.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -107,10 +107,12 @@ class MetaPlugin:
         self._config: dict[str, Any] = config or {}
         self._access_token: str | None = None
         self._game_info: object | None = None
+        self._livestream_id: str | None = None
 
     def register(self, registry: HookRegistry) -> None:
         """Register hook handlers with the reeln plugin registry."""
         registry.register(Hook.ON_GAME_INIT, self.on_game_init)
+        registry.register(Hook.ON_GAME_READY, self.on_game_ready)
         registry.register(Hook.ON_GAME_FINISH, self.on_game_finish)
 
     def _ensure_auth(self) -> str | None:
@@ -190,14 +192,59 @@ class MetaPlugin:
             log.warning("Meta plugin: livestream creation failed: %s", exc)
             return
 
+        self._livestream_id = result.id
         context.shared["livestreams"] = context.shared.get("livestreams", {})
         context.shared["livestreams"]["meta"] = result.embed_url
         log.info("Meta plugin: created livestream %s", result.embed_url)
+
+    def on_game_ready(self, context: HookContext) -> None:
+        """Handle ``ON_GAME_READY`` — update livestream with enriched metadata."""
+        if self._livestream_id is None:
+            return
+
+        metadata = context.shared.get("livestream_metadata")
+        if not metadata:
+            return
+
+        access_token = self._ensure_auth()
+        if access_token is None:
+            return
+
+        title = metadata.get("title", "")
+        description = metadata.get("description", "")
+
+        if not title and not description:
+            return
+
+        if self._config.get("dry_run"):
+            log.info(
+                "Meta plugin: [DRY RUN] would update livestream %s — title=%r",
+                self._livestream_id,
+                title,
+            )
+            return
+
+        try:
+            livestream.update_livestream(
+                live_video_id=self._livestream_id,
+                access_token=access_token,
+                title=title,
+                description=description,
+                api_version=self._config.get("graph_api_version", "v24.0"),
+            )
+        except livestream.LivestreamError as exc:
+            log.warning(
+                "Meta plugin: livestream update failed (non-fatal): %s", exc
+            )
+            return
+
+        log.info("Meta plugin: updated livestream %s metadata", self._livestream_id)
 
     def on_game_finish(self, context: HookContext) -> None:
         """Handle ``ON_GAME_FINISH`` — reset cached state."""
         self._access_token = None
         self._game_info = None
+        self._livestream_id = None
 
     def _build_title(self, game_info: object) -> str:
         """Build a livestream title from game info."""

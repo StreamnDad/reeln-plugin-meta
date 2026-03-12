@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-03-12
+
+### Added
+
+- `ON_GAME_READY` hook handler — updates livestream title and description with enriched metadata from other plugins
+- `update_livestream()` in `livestream.py` — POST to `/{live_video_id}` to update metadata on an existing Facebook Live Video
+- `_livestream_id` instance state — cached from `on_game_init` for use in `on_game_ready`
+- Dry-run support for `on_game_ready`
+
+### Changed
+
+- Plugin now registers three hooks: `ON_GAME_INIT`, `ON_GAME_READY`, `ON_GAME_FINISH`
+- `on_game_finish` also resets `_livestream_id`
+
 ## [0.4.0] - 2026-03-09
 
 ### Added
