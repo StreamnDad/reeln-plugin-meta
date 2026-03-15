@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -46,6 +49,70 @@ def http_post(url: str, payload: dict[str, str]) -> dict[str, Any]:
         return json.loads(body)  # type: ignore[no-any-return]
     except json.JSONDecodeError as exc:
         raise GraphAPIError(f"Invalid JSON response: {body[:200]}") from exc
+
+
+def http_post_multipart(
+    url: str,
+    fields: dict[str, str],
+    files: dict[str, Path],
+) -> dict[str, Any]:
+    """Send a multipart/form-data POST and return parsed JSON.
+
+    Args:
+        url: API endpoint URL.
+        fields: Text form fields (e.g. ``{"access_token": "tok"}``).
+        files: File fields mapping field name to file path.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        GraphAPIError: On HTTP or parsing errors.
+    """
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    for name, value in fields.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode()
+        )
+
+    for name, path in files.items():
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        file_data = path.read_bytes()
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode()
+        parts.append(header + file_data + b"\r\n")
+
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_body = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode() if exc.fp else ""
+        detail = format_meta_error(error_body)
+        raise GraphAPIError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GraphAPIError(f"Request failed: {exc.reason}") from exc
+
+    try:
+        return json.loads(response_body)  # type: ignore[no-any-return]
+    except json.JSONDecodeError as exc:
+        raise GraphAPIError(f"Invalid JSON response: {response_body[:200]}") from exc
 
 
 def format_meta_error(details: str) -> str:

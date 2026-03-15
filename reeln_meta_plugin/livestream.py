@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
-from reeln_meta_plugin.graph_api import GraphAPIError, http_post
+from reeln_meta_plugin.graph_api import GraphAPIError, http_post, http_post_multipart
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -32,12 +33,11 @@ def create_livestream(
     description: str = "",
     api_version: str = "v24.0",
     status: str = "LIVE_NOW",
-    privacy: str = "EVERYONE",
+    privacy: str = "",
     content_category: str = "SPORTS",
     game_id: str = "",
-    save_vod: bool = True,
-    published: bool = True,
     stop_on_delete_stream: bool = False,
+    event_params: str = "",
 ) -> LivestreamResult:
     """Create a Facebook Live Video on a Page.
 
@@ -47,13 +47,15 @@ def create_livestream(
         title: Live video title.
         description: Live video description.
         api_version: Graph API version.
-        status: Broadcast status (``LIVE_NOW`` or ``UNPUBLISHED``).
-        privacy: Privacy setting (``EVERYONE`` or ``SELF``).
+        status: Broadcast status (``LIVE_NOW``, ``UNPUBLISHED``, or
+            ``SCHEDULED_UNPUBLISHED``).
+        privacy: Privacy setting (omit for Pages, or ``EVERYONE``/``SELF``
+            for User tokens).
         content_category: Content category (e.g. ``SPORTS``, ``VIDEO_GAMING``).
         game_id: Facebook game ID to tag the broadcast with.
-        save_vod: Whether to save a VOD recording after broadcast ends.
-        published: Whether the VOD publishes to the Page timeline.
         stop_on_delete_stream: Auto-end broadcast when RTMP disconnects.
+        event_params: Unix timestamp for scheduled start time. Required when
+            status is ``SCHEDULED_UNPUBLISHED``.
 
     Returns:
         A ``LivestreamResult`` with the live video ID, stream URL, and embed URL.
@@ -67,15 +69,16 @@ def create_livestream(
         "description": description,
         "access_token": access_token,
         "status": status,
-        "privacy": json.dumps({"value": privacy}),
         "content_category": content_category,
-        "save_vod": json.dumps(save_vod),
-        "published": json.dumps(published),
         "stop_on_delete_stream": json.dumps(stop_on_delete_stream),
     }
 
+    if privacy:
+        payload["privacy"] = json.dumps({"value": privacy})
     if game_id:
         payload["game_id"] = game_id
+    if event_params:
+        payload["event_params"] = event_params
 
     try:
         data = http_post(url, payload)
@@ -126,5 +129,35 @@ def update_livestream(
 
     try:
         http_post(url, payload)
+    except GraphAPIError as exc:
+        raise LivestreamError(str(exc)) from exc
+
+
+def upload_thumbnail(
+    *,
+    live_video_id: str,
+    access_token: str,
+    image_path: Path,
+    api_version: str = "v24.0",
+) -> None:
+    """Upload a custom thumbnail to a Facebook Live Video.
+
+    Args:
+        live_video_id: The live video ID to update.
+        access_token: Page Access Token.
+        image_path: Path to the thumbnail image file.
+        api_version: Graph API version.
+
+    Raises:
+        LivestreamError: If the upload fails.
+    """
+    url = f"https://graph.facebook.com/{api_version}/{live_video_id}"
+
+    try:
+        http_post_multipart(
+            url,
+            fields={"access_token": access_token},
+            files={"custom_image": image_path},
+        )
     except GraphAPIError as exc:
         raise LivestreamError(str(exc)) from exc

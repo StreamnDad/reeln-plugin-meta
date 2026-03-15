@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,7 @@ from reeln_meta_plugin.livestream import (
     LivestreamResult,
     create_livestream,
     update_livestream,
+    upload_thumbnail,
 )
 
 
@@ -106,10 +108,9 @@ class TestCreateLivestream:
 
         _, payload = mock_post.call_args[0]
         assert payload["status"] == "LIVE_NOW"
-        assert json.loads(payload["privacy"]) == {"value": "EVERYONE"}
+        assert "privacy" not in payload
+        assert "event_params" not in payload
         assert payload["content_category"] == "SPORTS"
-        assert json.loads(payload["save_vod"]) is True
-        assert json.loads(payload["published"]) is True
         assert json.loads(payload["stop_on_delete_stream"]) is False
 
     def test_custom_status_and_privacy(self) -> None:
@@ -122,8 +123,6 @@ class TestCreateLivestream:
                 status="UNPUBLISHED",
                 privacy="SELF",
                 content_category="VIDEO_GAMING",
-                save_vod=False,
-                published=False,
                 stop_on_delete_stream=True,
             )
 
@@ -131,8 +130,6 @@ class TestCreateLivestream:
         assert payload["status"] == "UNPUBLISHED"
         assert json.loads(payload["privacy"]) == {"value": "SELF"}
         assert payload["content_category"] == "VIDEO_GAMING"
-        assert json.loads(payload["save_vod"]) is False
-        assert json.loads(payload["published"]) is False
         assert json.loads(payload["stop_on_delete_stream"]) is True
 
     def test_game_id_included_when_set(self) -> None:
@@ -155,6 +152,29 @@ class TestCreateLivestream:
 
         _, payload = mock_post.call_args[0]
         assert "game_id" not in payload
+
+    def test_event_params_included_when_set(self) -> None:
+        response = {"id": "1", "stream_url": "rtmps://x"}
+        with patch("reeln_meta_plugin.livestream.http_post", return_value=response) as mock_post:
+            create_livestream(
+                page_id="p",
+                access_token="t",
+                title="T",
+                status="SCHEDULED_UNPUBLISHED",
+                event_params="1741539800",
+            )
+
+        _, payload = mock_post.call_args[0]
+        assert payload["status"] == "SCHEDULED_UNPUBLISHED"
+        assert payload["event_params"] == "1741539800"
+
+    def test_event_params_omitted_when_empty(self) -> None:
+        response = {"id": "1", "stream_url": "rtmps://x"}
+        with patch("reeln_meta_plugin.livestream.http_post", return_value=response) as mock_post:
+            create_livestream(page_id="p", access_token="t", title="T")
+
+        _, payload = mock_post.call_args[0]
+        assert "event_params" not in payload
 
     def test_graph_api_error_wrapped_as_livestream_error(self) -> None:
         with (
@@ -250,4 +270,54 @@ class TestUpdateLivestream:
                 live_video_id="live-123",
                 access_token="tok",
                 title="T",
+            )
+
+
+class TestUploadThumbnail:
+    def test_success(self, tmp_path: Path) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+
+        with patch("reeln_meta_plugin.livestream.http_post_multipart", return_value={}) as mock_post:
+            upload_thumbnail(
+                live_video_id="live-123",
+                access_token="tok",
+                image_path=thumb,
+            )
+
+        url = mock_post.call_args[0][0]
+        kwargs = mock_post.call_args[1]
+        assert "live-123" in url
+        assert kwargs["fields"]["access_token"] == "tok"
+        assert kwargs["files"]["custom_image"] == thumb
+
+    def test_custom_api_version(self, tmp_path: Path) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+
+        with patch("reeln_meta_plugin.livestream.http_post_multipart", return_value={}) as mock_post:
+            upload_thumbnail(
+                live_video_id="live-123",
+                access_token="tok",
+                image_path=thumb,
+                api_version="v23.0",
+            )
+
+        assert "v23.0" in mock_post.call_args[0][0]
+
+    def test_graph_api_error_wrapped(self, tmp_path: Path) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+
+        with (
+            patch(
+                "reeln_meta_plugin.livestream.http_post_multipart",
+                side_effect=GraphAPIError("HTTP 500: server error"),
+            ),
+            pytest.raises(LivestreamError, match="HTTP 500"),
+        ):
+            upload_thumbnail(
+                live_video_id="live-123",
+                access_token="tok",
+                image_path=thumb,
             )
