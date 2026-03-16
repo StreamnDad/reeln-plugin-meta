@@ -24,7 +24,7 @@ class TestMetaPluginAttributes:
 
     def test_version(self) -> None:
         plugin = MetaPlugin()
-        assert plugin.version == "0.5.0"
+        assert plugin.version == "0.7.0"
 
     def test_api_version(self) -> None:
         plugin = MetaPlugin()
@@ -78,7 +78,7 @@ class TestMetaPluginConfigSchema:
         schema = MetaPlugin.config_schema
         field = schema.field_by_name("privacy")
         assert field is not None
-        assert field.default == "EVERYONE"
+        assert field.default == ""
 
     def test_content_category_default(self) -> None:
         schema = MetaPlugin.config_schema
@@ -91,18 +91,6 @@ class TestMetaPluginConfigSchema:
         field = schema.field_by_name("game_id")
         assert field is not None
         assert field.default == ""
-
-    def test_save_vod_default(self) -> None:
-        schema = MetaPlugin.config_schema
-        field = schema.field_by_name("save_vod")
-        assert field is not None
-        assert field.default is True
-
-    def test_published_default(self) -> None:
-        schema = MetaPlugin.config_schema
-        field = schema.field_by_name("published")
-        assert field is not None
-        assert field.default is True
 
     def test_stop_on_delete_stream_default(self) -> None:
         schema = MetaPlugin.config_schema
@@ -234,6 +222,63 @@ class TestBuildTitle:
 
         title = plugin._build_title(Bare())
         assert title == " vs  - "
+
+
+class TestComputeEventParams:
+    def test_valid_12h_format(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="7:00 PM")
+        result = MetaPlugin._compute_event_params(game_info)
+        assert result.isdigit()
+        assert int(result) > 0
+
+    def test_valid_24h_format(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="19:00")
+        result = MetaPlugin._compute_event_params(game_info)
+        assert result.isdigit()
+
+    def test_valid_12h_no_space(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="7:00PM")
+        result = MetaPlugin._compute_event_params(game_info)
+        assert result.isdigit()
+
+    def test_valid_12h_with_timezone(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="8:15PM CDT")
+        result = MetaPlugin._compute_event_params(game_info)
+        assert result.isdigit()
+
+    def test_valid_12h_space_with_timezone(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="8:15 PM CDT")
+        result = MetaPlugin._compute_event_params(game_info)
+        assert result.isdigit()
+
+    def test_empty_game_time(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="")
+        assert MetaPlugin._compute_event_params(game_info) == ""
+
+    def test_empty_date(self) -> None:
+        game_info = FakeGameInfo(date="", game_time="7:00 PM")
+        assert MetaPlugin._compute_event_params(game_info) == ""
+
+    def test_invalid_time_format(self) -> None:
+        game_info = FakeGameInfo(date="2026-03-14", game_time="asdf")
+        assert MetaPlugin._compute_event_params(game_info) == ""
+
+    def test_invalid_date_format(self) -> None:
+        game_info = FakeGameInfo(date="March 14", game_time="7:00 PM")
+        assert MetaPlugin._compute_event_params(game_info) == ""
+
+    def test_missing_attributes(self) -> None:
+        class Bare:
+            pass
+
+        assert MetaPlugin._compute_event_params(Bare()) == ""
+
+    def test_consistent_output(self) -> None:
+        """Same inputs produce the same timestamp."""
+        game_info = FakeGameInfo(date="2026-03-14", game_time="7:00 PM")
+        result1 = MetaPlugin._compute_event_params(game_info)
+        result2 = MetaPlugin._compute_event_params(game_info)
+        assert result1 == result2
 
 
 _FAKE_RESULT = LivestreamResult(
@@ -431,22 +476,37 @@ class TestOnGameInit:
 
         kwargs = mock_create.call_args[1]
         assert kwargs["status"] == "LIVE_NOW"
-        assert kwargs["privacy"] == "EVERYONE"
+        assert kwargs["event_params"] == ""
+        assert kwargs["privacy"] == ""
         assert kwargs["content_category"] == "SPORTS"
         assert kwargs["game_id"] == ""
-        assert kwargs["save_vod"] is True
-        assert kwargs["published"] is True
         assert kwargs["stop_on_delete_stream"] is False
+
+    def test_scheduled_unpublished_with_game_time(self, plugin_config: dict[str, Any]) -> None:
+        """With SCHEDULED_UNPUBLISHED + game_time, computes event_params."""
+        plugin_config["status"] = "SCHEDULED_UNPUBLISHED"
+        plugin = MetaPlugin(plugin_config)
+        game_info = FakeGameInfo(game_time="7:00 PM")
+        context = HookContext(hook=Hook.ON_GAME_INIT, data={"game_info": game_info})
+
+        with patch(
+            "reeln_meta_plugin.plugin.livestream.create_livestream",
+            return_value=_FAKE_RESULT,
+        ) as mock_create:
+            plugin.on_game_init(context)
+
+        kwargs = mock_create.call_args[1]
+        assert kwargs["status"] == "SCHEDULED_UNPUBLISHED"
+        assert kwargs["event_params"] != ""
+        assert kwargs["event_params"].isdigit()
 
     def test_custom_livestream_settings(self, plugin_config: dict[str, Any]) -> None:
         """Verify config overrides flow through to create_livestream."""
         plugin_config.update({
-            "status": "UNPUBLISHED",
+            "status": "LIVE_NOW",
             "privacy": "SELF",
             "content_category": "VIDEO_GAMING",
             "game_id": "42",
-            "save_vod": False,
-            "published": False,
             "stop_on_delete_stream": True,
         })
         plugin = MetaPlugin(plugin_config)
@@ -460,13 +520,31 @@ class TestOnGameInit:
             plugin.on_game_init(context)
 
         kwargs = mock_create.call_args[1]
-        assert kwargs["status"] == "UNPUBLISHED"
+        assert kwargs["status"] == "LIVE_NOW"
         assert kwargs["privacy"] == "SELF"
         assert kwargs["content_category"] == "VIDEO_GAMING"
         assert kwargs["game_id"] == "42"
-        assert kwargs["save_vod"] is False
-        assert kwargs["published"] is False
         assert kwargs["stop_on_delete_stream"] is True
+
+    def test_scheduled_fallback_logs_warning(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """SCHEDULED_UNPUBLISHED with no game_time logs a warning about fallback."""
+        plugin_config["status"] = "SCHEDULED_UNPUBLISHED"
+        plugin = MetaPlugin(plugin_config)
+        game_info = FakeGameInfo()  # no game_time
+        context = HookContext(hook=Hook.ON_GAME_INIT, data={"game_info": game_info})
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.livestream.create_livestream",
+                return_value=_FAKE_RESULT,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_game_init(context)
+
+        assert "falling back to LIVE_NOW" in caplog.text
 
     def test_logs_info_on_success(
         self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
@@ -485,6 +563,7 @@ class TestOnGameInit:
             plugin.on_game_init(context)
 
         assert "created livestream" in caplog.text
+        assert "stream_url=" in caplog.text
 
     def test_uses_cached_token(self, plugin_config: dict[str, Any]) -> None:
         """Verify _ensure_auth caching — read_token called once across two on_game_init calls."""
@@ -568,16 +647,20 @@ class TestOnGameReady:
 
         mock_update.assert_not_called()
 
-    def test_skips_when_no_metadata(self, plugin_config: dict[str, Any]) -> None:
+    def test_skips_when_no_metadata_or_thumbnail(self, plugin_config: dict[str, Any]) -> None:
         plugin = self._ready_plugin(plugin_config)
         context = HookContext(hook=Hook.ON_GAME_READY, data={})
 
-        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
             plugin.on_game_ready(context)
 
         mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
 
-    def test_skips_when_metadata_empty(self, plugin_config: dict[str, Any]) -> None:
+    def test_skips_when_metadata_empty_no_thumbnail(self, plugin_config: dict[str, Any]) -> None:
         plugin = self._ready_plugin(plugin_config)
         context = HookContext(
             hook=Hook.ON_GAME_READY,
@@ -585,12 +668,16 @@ class TestOnGameReady:
             shared={"livestream_metadata": {}},
         )
 
-        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
             plugin.on_game_ready(context)
 
         mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
 
-    def test_skips_when_title_and_description_empty(self, plugin_config: dict[str, Any]) -> None:
+    def test_skips_when_title_desc_empty_no_thumbnail(self, plugin_config: dict[str, Any]) -> None:
         plugin = self._ready_plugin(plugin_config)
         context = HookContext(
             hook=Hook.ON_GAME_READY,
@@ -598,10 +685,14 @@ class TestOnGameReady:
             shared={"livestream_metadata": {"title": "", "description": ""}},
         )
 
-        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
             plugin.on_game_ready(context)
 
         mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
 
     def test_skips_when_auth_fails(self, plugin_config: dict[str, Any]) -> None:
         plugin = MetaPlugin(plugin_config)
@@ -739,10 +830,14 @@ class TestOnGameReady:
             shared={"livestream_metadata": {"title": "T"}},
         )
 
-        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
             plugin.on_game_ready(context)
 
         mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
 
     def test_dry_run_logs_info(
         self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
@@ -760,6 +855,222 @@ class TestOnGameReady:
 
         assert "DRY RUN" in caplog.text
         assert "would update livestream" in caplog.text
+
+
+class TestOnGameReadyThumbnail:
+    def _ready_plugin(self, plugin_config: dict[str, Any]) -> MetaPlugin:
+        """Return a plugin with cached state as if on_game_init already ran."""
+        plugin = MetaPlugin(plugin_config)
+        plugin._livestream_id = "live-123"
+        plugin._access_token = "test-access-token-123"
+        return plugin
+
+    def test_uploads_thumbnail(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(thumb)}},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+        mock_thumb.assert_called_once_with(
+            live_video_id="live-123",
+            access_token="test-access-token-123",
+            image_path=thumb,
+            api_version="v24.0",
+        )
+
+    def test_uploads_thumbnail_with_metadata(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={
+                "livestream_metadata": {"title": "T"},
+                "game_image": {"image_path": str(thumb)},
+            },
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_called_once()
+        mock_thumb.assert_called_once()
+
+    def test_skips_when_image_path_empty(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": ""}},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
+
+    def test_skips_when_image_file_missing(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(tmp_path / "nonexistent.png")}},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
+
+    def test_skips_when_game_image_not_dict(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": "not-a-dict"},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_update.assert_not_called()
+        mock_thumb.assert_not_called()
+
+    def test_thumbnail_error_nonfatal(
+        self, plugin_config: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(thumb)}},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.livestream.upload_thumbnail",
+                side_effect=LivestreamError("upload failed"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_game_ready(context)
+
+        assert "thumbnail upload failed" in caplog.text
+
+    def test_metadata_error_still_uploads_thumbnail(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={
+                "livestream_metadata": {"title": "T"},
+                "game_image": {"image_path": str(thumb)},
+            },
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.livestream.update_livestream",
+                side_effect=LivestreamError("api error"),
+            ),
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb,
+        ):
+            plugin.on_game_ready(context)
+
+        mock_thumb.assert_called_once()
+
+    def test_custom_api_version_for_thumbnail(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        plugin_config["graph_api_version"] = "v23.0"
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(thumb)}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb:
+            plugin.on_game_ready(context)
+
+        assert mock_thumb.call_args[1]["api_version"] == "v23.0"
+
+    def test_dry_run_skips_thumbnail(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        plugin_config["dry_run"] = True
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(thumb)}},
+        )
+
+        with patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail") as mock_thumb:
+            plugin.on_game_ready(context)
+
+        mock_thumb.assert_not_called()
+
+    def test_dry_run_logs_thumbnail_path(
+        self, plugin_config: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin_config["dry_run"] = True
+        thumb = tmp_path / "thumb.png"
+        thumb.write_bytes(b"\x89PNG")
+        plugin = self._ready_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_READY,
+            data={},
+            shared={"game_image": {"image_path": str(thumb)}},
+        )
+
+        with caplog.at_level(logging.INFO):
+            plugin.on_game_ready(context)
+
+        assert "DRY RUN" in caplog.text
+        assert "thumb.png" in caplog.text
 
 
 class TestOnGameFinish:
@@ -827,14 +1138,17 @@ class TestIntegrationWithRegistry:
         assert plugin._access_token is not None
         assert plugin._livestream_id == "live-123"
 
-        # ON_GAME_READY — update metadata
+        # ON_GAME_READY — update metadata and thumbnail
         ready_context = HookContext(
             hook=Hook.ON_GAME_READY,
             data={},
             shared={"livestream_metadata": {"title": "Storm vs Thunder - Updated"}},
         )
 
-        with patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update:
+        with (
+            patch("reeln_meta_plugin.plugin.livestream.update_livestream") as mock_update,
+            patch("reeln_meta_plugin.plugin.livestream.upload_thumbnail"),
+        ):
             registry.emit(Hook.ON_GAME_READY, ready_context)
 
         mock_update.assert_called_once()

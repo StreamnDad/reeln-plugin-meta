@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-03-15
+
+### Added
+
+- `event_params` parameter on `create_livestream()` — Unix timestamp for scheduled start time
+- `_compute_event_params()` helper — parses `game_info.date` + `game_info.game_time` into Unix timestamp (supports 12h/24h formats, strips timezone suffixes like "CDT")
+- Automatic fallback: if `SCHEDULED_UNPUBLISHED` configured but no `game_time` available, falls back to `LIVE_NOW` with a warning
+
+### Discovered
+
+- `SCHEDULED_UNPUBLISHED` status is **deprecated** by Facebook — API returns `(#100) Invalid broadcast status, Scheduled Live has been deprecated` despite still being documented
+- Facebook live video requirements (since June 2024): account 60+ days old AND Page 100+ followers
+- Dry-run log now includes status in the output
+
+## [0.6.0] - 2026-03-13
+
+### Added
+
+- Thumbnail upload support in `on_game_ready` — reads `context.shared["game_image"]["image_path"]` and uploads as custom thumbnail
+- `upload_thumbnail()` in `livestream.py` — multipart POST to `/{live_video_id}` with `custom_image` field
+- `http_post_multipart()` in `graph_api.py` — multipart/form-data POST helper for file uploads
+- Metadata update and thumbnail upload are independent — either or both can succeed/fail non-fatally
+
+### Changed
+
+- `on_game_ready` now handles both metadata updates and thumbnail uploads independently
+
+### Removed
+
+- `save_vod` config field and API parameter — deprecated by Facebook (Graph API v24.0)
+- `published` config field and API parameter — mutually exclusive with `status` (use `status` instead)
+- `privacy` default changed from `EVERYONE` to empty string — `privacy` causes `(#200) Permissions error` with Page Access Tokens; only works with User tokens
+
 ## [0.5.0] - 2026-03-12
 
 ### Added

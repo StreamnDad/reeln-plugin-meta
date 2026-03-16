@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ class MetaPlugin:
     """
 
     name: str = "meta"
-    version: str = "0.5.0"
+    version: str = "0.7.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -67,8 +68,8 @@ class MetaPlugin:
             ConfigField(
                 name="privacy",
                 field_type="str",
-                default="EVERYONE",
-                description="Privacy setting (EVERYONE or SELF)",
+                default="",
+                description="Privacy setting (omit for Pages, or EVERYONE/SELF for User tokens)",
             ),
             ConfigField(
                 name="content_category",
@@ -81,18 +82,6 @@ class MetaPlugin:
                 field_type="str",
                 default="",
                 description="Facebook game ID to tag the broadcast with",
-            ),
-            ConfigField(
-                name="save_vod",
-                field_type="bool",
-                default=True,
-                description="Save a VOD recording after broadcast ends",
-            ),
-            ConfigField(
-                name="published",
-                field_type="bool",
-                default=True,
-                description="Publish VOD to Page timeline after broadcast ends",
             ),
             ConfigField(
                 name="stop_on_delete_stream",
@@ -164,12 +153,25 @@ class MetaPlugin:
 
         title = self._build_title(game_info)
         description = getattr(game_info, "description", "")
+        status = self._config.get("status", "LIVE_NOW")
+
+        event_params = ""
+        if status == "SCHEDULED_UNPUBLISHED":
+            event_params = self._compute_event_params(game_info)
+            if not event_params:
+                log.warning(
+                    "Meta plugin: SCHEDULED_UNPUBLISHED requires game_time, "
+                    "falling back to LIVE_NOW"
+                )
+                status = "LIVE_NOW"
 
         if self._config.get("dry_run"):
             log.info(
-                "Meta plugin: [DRY RUN] would create livestream — title=%r, page_id=%s",
+                "Meta plugin: [DRY RUN] would create livestream — "
+                "title=%r, page_id=%s, status=%s",
                 title,
                 page_id,
+                status,
             )
             return
 
@@ -180,13 +182,12 @@ class MetaPlugin:
                 title=title,
                 description=description,
                 api_version=self._config.get("graph_api_version", "v24.0"),
-                status=self._config.get("status", "LIVE_NOW"),
-                privacy=self._config.get("privacy", "EVERYONE"),
+                status=status,
+                privacy=self._config.get("privacy", ""),
                 content_category=self._config.get("content_category", "SPORTS"),
                 game_id=self._config.get("game_id", ""),
-                save_vod=self._config.get("save_vod", True),
-                published=self._config.get("published", True),
                 stop_on_delete_stream=self._config.get("stop_on_delete_stream", False),
+                event_params=event_params,
             )
         except livestream.LivestreamError as exc:
             log.warning("Meta plugin: livestream creation failed: %s", exc)
@@ -195,56 +196,127 @@ class MetaPlugin:
         self._livestream_id = result.id
         context.shared["livestreams"] = context.shared.get("livestreams", {})
         context.shared["livestreams"]["meta"] = result.embed_url
-        log.info("Meta plugin: created livestream %s", result.embed_url)
+        log.info(
+            "Meta plugin: created livestream id=%s embed=%s stream_url=%s",
+            result.id,
+            result.embed_url,
+            result.stream_url,
+        )
 
     def on_game_ready(self, context: HookContext) -> None:
-        """Handle ``ON_GAME_READY`` — update livestream with enriched metadata."""
+        """Handle ``ON_GAME_READY`` — update livestream with enriched metadata and thumbnail."""
         if self._livestream_id is None:
             return
 
-        metadata = context.shared.get("livestream_metadata")
-        if not metadata:
+        metadata = context.shared.get("livestream_metadata") or {}
+        title = metadata.get("title", "")
+        description = metadata.get("description", "")
+
+        game_image = context.shared.get("game_image", {})
+        image_path_str = (
+            game_image.get("image_path", "") if isinstance(game_image, dict) else ""
+        )
+        thumbnail_path = Path(image_path_str) if image_path_str else None
+
+        has_metadata = bool(title or description)
+        has_thumbnail = thumbnail_path is not None and thumbnail_path.exists()
+
+        if not has_metadata and not has_thumbnail:
             return
 
         access_token = self._ensure_auth()
         if access_token is None:
             return
 
-        title = metadata.get("title", "")
-        description = metadata.get("description", "")
-
-        if not title and not description:
-            return
+        api_version = self._config.get("graph_api_version", "v24.0")
 
         if self._config.get("dry_run"):
             log.info(
-                "Meta plugin: [DRY RUN] would update livestream %s — title=%r",
+                "Meta plugin: [DRY RUN] would update livestream %s — title=%r, thumbnail=%s",
                 self._livestream_id,
                 title,
+                thumbnail_path,
             )
             return
 
-        try:
-            livestream.update_livestream(
-                live_video_id=self._livestream_id,
-                access_token=access_token,
-                title=title,
-                description=description,
-                api_version=self._config.get("graph_api_version", "v24.0"),
-            )
-        except livestream.LivestreamError as exc:
-            log.warning(
-                "Meta plugin: livestream update failed (non-fatal): %s", exc
-            )
-            return
+        if has_metadata:
+            try:
+                livestream.update_livestream(
+                    live_video_id=self._livestream_id,
+                    access_token=access_token,
+                    title=title,
+                    description=description,
+                    api_version=api_version,
+                )
+            except livestream.LivestreamError as exc:
+                log.warning(
+                    "Meta plugin: livestream update failed (non-fatal): %s", exc
+                )
 
-        log.info("Meta plugin: updated livestream %s metadata", self._livestream_id)
+        if has_thumbnail and thumbnail_path is not None:
+            try:
+                livestream.upload_thumbnail(
+                    live_video_id=self._livestream_id,
+                    access_token=access_token,
+                    image_path=thumbnail_path,
+                    api_version=api_version,
+                )
+            except livestream.LivestreamError as exc:
+                log.warning(
+                    "Meta plugin: thumbnail upload failed (non-fatal): %s", exc
+                )
+
+        log.info("Meta plugin: updated livestream %s", self._livestream_id)
 
     def on_game_finish(self, context: HookContext) -> None:
         """Handle ``ON_GAME_FINISH`` — reset cached state."""
         self._access_token = None
         self._game_info = None
         self._livestream_id = None
+
+    @staticmethod
+    def _compute_event_params(game_info: object) -> str:
+        """Compute a Unix timestamp from game_info date and game_time.
+
+        Returns:
+            Unix timestamp as a string, or empty string if game_time is missing
+            or cannot be parsed.
+        """
+        date_str = getattr(game_info, "date", "")
+        game_time_str = getattr(game_info, "game_time", "")
+
+        if not date_str or not game_time_str:
+            return ""
+
+        # Strip trailing timezone abbreviations (e.g. "8:15PM CDT" → "8:15PM")
+        time_clean = game_time_str.strip()
+        parts = time_clean.rsplit(maxsplit=1)
+        if len(parts) == 2 and parts[1].isalpha():
+            time_clean = parts[0]
+
+        time_formats = ["%I:%M %p", "%I:%M%p", "%H:%M"]
+        parsed_time = None
+        for fmt in time_formats:
+            try:
+                parsed_time = datetime.strptime(time_clean.strip(), fmt)
+                break
+            except ValueError:
+                continue
+
+        if parsed_time is None:
+            return ""
+
+        try:
+            game_date = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        except ValueError:
+            return ""
+
+        local_dt = game_date.replace(
+            hour=parsed_time.hour, minute=parsed_time.minute
+        )
+        # naive datetime → .timestamp() assumes local timezone
+        timestamp = int(local_dt.timestamp())
+        return str(timestamp)
 
     def _build_title(self, game_info: object) -> str:
         """Build a livestream title from game info."""
