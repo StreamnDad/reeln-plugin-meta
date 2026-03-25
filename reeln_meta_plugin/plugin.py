@@ -11,7 +11,7 @@ from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
-from reeln_meta_plugin import auth, livestream
+from reeln_meta_plugin import auth, comments, facebook_reels, livestream, reels
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class MetaPlugin:
     """
 
     name: str = "meta"
-    version: str = "0.7.0"
+    version: str = "0.9.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -89,6 +89,72 @@ class MetaPlugin:
                 default=False,
                 description="Auto-end broadcast when RTMP stream disconnects",
             ),
+            ConfigField(
+                name="instagram_account_id",
+                field_type="str",
+                default="",
+                description="Instagram Business/Creator account ID (IG user ID)",
+            ),
+            ConfigField(
+                name="publish_reels",
+                field_type="bool",
+                default=False,
+                description="Enable Instagram Reel publishing on POST_RENDER",
+            ),
+            ConfigField(
+                name="post_instagram_comment",
+                field_type="bool",
+                default=False,
+                description="Enable posting a comment on published Reels",
+            ),
+            ConfigField(
+                name="reel_caption_template",
+                field_type="str",
+                default="",
+                description="Caption template for Reels ({home_team}, {away_team}, {date}, {venue})",
+            ),
+            ConfigField(
+                name="instagram_comment_template",
+                field_type="str",
+                default="",
+                description="Comment text template ({home_team}, {away_team}, {date}, {venue})",
+            ),
+            ConfigField(
+                name="publish_facebook_reels",
+                field_type="bool",
+                default=False,
+                description="Enable Facebook Page Reel publishing on POST_RENDER",
+            ),
+            ConfigField(
+                name="facebook_reel_description_template",
+                field_type="str",
+                default="",
+                description="Description template for Facebook Reels ({home_team}, {away_team}, {date}, {venue})",
+            ),
+            ConfigField(
+                name="reel_share_to_feed",
+                field_type="bool",
+                default=True,
+                description="Whether to also share the Reel to the Instagram feed",
+            ),
+            ConfigField(
+                name="reel_thumb_offset_ms",
+                field_type="int",
+                default=0,
+                description="Thumbnail offset in milliseconds from video start",
+            ),
+            ConfigField(
+                name="reel_poll_interval_seconds",
+                field_type="int",
+                default=5,
+                description="Seconds between container status polls",
+            ),
+            ConfigField(
+                name="reel_poll_max_attempts",
+                field_type="int",
+                default=60,
+                description="Maximum number of status poll attempts",
+            ),
         )
     )
 
@@ -97,12 +163,14 @@ class MetaPlugin:
         self._access_token: str | None = None
         self._game_info: object | None = None
         self._livestream_id: str | None = None
+        self._published_reel_id: str | None = None
 
     def register(self, registry: HookRegistry) -> None:
         """Register hook handlers with the reeln plugin registry."""
         registry.register(Hook.ON_GAME_INIT, self.on_game_init)
         registry.register(Hook.ON_GAME_READY, self.on_game_ready)
         registry.register(Hook.ON_GAME_FINISH, self.on_game_finish)
+        registry.register(Hook.POST_RENDER, self.on_post_render)
 
     def _ensure_auth(self) -> str | None:
         """Return cached access token, or read from file and cache.
@@ -268,11 +336,327 @@ class MetaPlugin:
 
         log.info("Meta plugin: updated livestream %s", self._livestream_id)
 
+    def on_post_render(self, context: HookContext) -> None:
+        """Handle ``POST_RENDER`` — publish Reels and/or post comment."""
+        publish_ig = self._config.get("publish_reels")
+        publish_fb = self._config.get("publish_facebook_reels")
+        comment = self._config.get("post_instagram_comment")
+
+        if not publish_ig and not publish_fb and not comment:
+            return
+
+        access_token = self._ensure_auth()
+        if access_token is None:
+            return
+
+        # Cache game_info from hook data if not set (create_livestream may be disabled)
+        if self._game_info is None:
+            hook_game_info = context.data.get("game_info")
+            if hook_game_info is not None:
+                self._game_info = hook_game_info
+
+        api_version = self._config.get("graph_api_version", "v24.0")
+
+        if publish_ig:
+            ig_user_id = self._config.get("instagram_account_id", "")
+            if not ig_user_id:
+                log.warning("Meta plugin: instagram_account_id not configured, skipping IG Reel")
+            else:
+                self._publish_reel(context, ig_user_id, access_token, api_version)
+
+        if publish_fb:
+            self._publish_facebook_reel(context, access_token, api_version)
+
+        if comment and self._published_reel_id:
+            self._post_comment(access_token, api_version)
+
+    def _publish_reel(
+        self,
+        context: HookContext,
+        ig_user_id: str,
+        access_token: str,
+        api_version: str,
+    ) -> None:
+        """Execute the full Reel publishing flow."""
+        video_url = context.shared.get("video_url", "")
+        if not video_url:
+            log.warning(
+                "Meta plugin: no video_url in shared context, skipping Reel publish"
+            )
+            return
+
+        caption = self._build_caption(context)
+
+        if self._config.get("dry_run"):
+            log.info(
+                "Meta plugin: [DRY RUN] would publish Reel — "
+                "ig_user_id=%s, caption=%r, video_url=%s",
+                ig_user_id,
+                caption,
+                video_url,
+            )
+            return
+
+        try:
+            container = reels.create_reel_container(
+                ig_user_id=ig_user_id,
+                access_token=access_token,
+                video_url=video_url,
+                caption=caption,
+                share_to_feed=self._config.get("reel_share_to_feed", True),
+                thumb_offset=self._config.get("reel_thumb_offset_ms", 0),
+                api_version=api_version,
+            )
+        except reels.ReelsError as exc:
+            log.warning("Meta plugin: Reel container creation failed: %s", exc)
+            return
+
+        try:
+            reels.poll_container_status(
+                container_id=container.container_id,
+                access_token=access_token,
+                api_version=api_version,
+                max_attempts=self._config.get("reel_poll_max_attempts", 60),
+                poll_interval=float(
+                    self._config.get("reel_poll_interval_seconds", 5)
+                ),
+            )
+        except reels.ReelsError as exc:
+            log.warning("Meta plugin: Reel container polling failed: %s", exc)
+            return
+
+        try:
+            media_id = reels.publish_reel(
+                ig_user_id=ig_user_id,
+                access_token=access_token,
+                container_id=container.container_id,
+                api_version=api_version,
+            )
+        except reels.ReelsError as exc:
+            log.warning("Meta plugin: Reel publish failed: %s", exc)
+            return
+
+        self._published_reel_id = media_id
+
+        permalink = ""
+        try:
+            permalink = reels.get_permalink(
+                media_id=media_id,
+                access_token=access_token,
+                api_version=api_version,
+            )
+        except reels.ReelsError as exc:
+            log.warning("Meta plugin: permalink retrieval failed (non-fatal): %s", exc)
+
+        context.shared["reels"] = context.shared.get("reels", {})
+        context.shared["reels"]["meta"] = permalink
+        log.info(
+            "Meta plugin: published Reel media_id=%s permalink=%s",
+            media_id,
+            permalink,
+        )
+
+    def _post_comment(self, access_token: str, api_version: str) -> None:
+        """Post a comment on the last published Reel."""
+        message = self._build_comment()
+        if not message:
+            log.warning("Meta plugin: instagram_comment_template is empty, skipping comment")
+            return
+
+        if self._config.get("dry_run"):
+            log.info(
+                "Meta plugin: [DRY RUN] would post comment — "
+                "media_id=%s, message=%r",
+                self._published_reel_id,
+                message,
+            )
+            return
+
+        try:
+            result = comments.post_comment(
+                media_id=self._published_reel_id or "",
+                access_token=access_token,
+                message=message,
+                api_version=api_version,
+            )
+        except comments.CommentError as exc:
+            log.warning("Meta plugin: comment posting failed (non-fatal): %s", exc)
+            return
+
+        log.info(
+            "Meta plugin: posted comment id=%s on media %s",
+            result.comment_id,
+            self._published_reel_id,
+        )
+
+    def _publish_facebook_reel(
+        self,
+        context: HookContext,
+        access_token: str,
+        api_version: str,
+    ) -> None:
+        """Execute the full Facebook Reel publishing flow."""
+        video_url = context.shared.get("video_url", "")
+        if not video_url:
+            log.warning(
+                "Meta plugin: no video_url in shared context, skipping Facebook Reel publish"
+            )
+            return
+
+        page_id = self._config.get("page_id", "")
+        if not page_id:
+            log.warning("Meta plugin: page_id not configured, skipping Facebook Reel")
+            return
+
+        title = self._build_facebook_reel_title(context)
+        description = self._build_facebook_reel_description(context)
+
+        if self._config.get("dry_run"):
+            log.info(
+                "Meta plugin: [DRY RUN] would publish Facebook Reel — "
+                "page_id=%s, title=%r, video_url=%s",
+                page_id,
+                title,
+                video_url,
+            )
+            return
+
+        try:
+            start = facebook_reels.start_reel_upload(
+                page_id=page_id,
+                access_token=access_token,
+                api_version=api_version,
+            )
+        except facebook_reels.FacebookReelsError as exc:
+            log.warning("Meta plugin: Facebook Reel start failed: %s", exc)
+            return
+
+        try:
+            facebook_reels.upload_reel_video(
+                upload_url=start.upload_url,
+                access_token=access_token,
+                video_url=str(video_url),
+            )
+        except facebook_reels.FacebookReelsError as exc:
+            log.warning("Meta plugin: Facebook Reel upload failed: %s", exc)
+            return
+
+        try:
+            facebook_reels.finish_reel(
+                page_id=page_id,
+                access_token=access_token,
+                video_id=start.video_id,
+                title=title,
+                description=description,
+                api_version=api_version,
+            )
+        except facebook_reels.FacebookReelsError as exc:
+            log.warning("Meta plugin: Facebook Reel publish failed: %s", exc)
+            return
+
+        try:
+            facebook_reels.poll_reel_status(
+                video_id=start.video_id,
+                access_token=access_token,
+                api_version=api_version,
+                max_attempts=self._config.get("reel_poll_max_attempts", 60),
+                poll_interval=float(
+                    self._config.get("reel_poll_interval_seconds", 5)
+                ),
+            )
+        except facebook_reels.FacebookReelsError as exc:
+            log.warning("Meta plugin: Facebook Reel polling failed: %s", exc)
+            return
+
+        context.shared["facebook_reels"] = context.shared.get("facebook_reels", {})
+        context.shared["facebook_reels"]["meta"] = start.video_id
+        log.info(
+            "Meta plugin: published Facebook Reel video_id=%s",
+            start.video_id,
+        )
+
+    def _build_facebook_reel_title(self, context: HookContext) -> str:
+        """Build a Facebook Reel title from render metadata or game info.
+
+        Resolution order:
+        1. ``context.shared["render_metadata"]["title"]`` (AI-generated)
+        2. ``_build_title(game_info)`` fallback
+        """
+        render_meta = context.shared.get("render_metadata", {})
+        title = str(render_meta.get("title", ""))
+        if title:
+            return title
+        if self._game_info is not None:
+            return self._build_title(self._game_info)
+        return ""
+
+    def _build_facebook_reel_description(self, context: HookContext) -> str:
+        """Build a Facebook Reel description from render metadata, template, or game info.
+
+        Resolution order:
+        1. ``context.shared["render_metadata"]["description"]`` (AI-generated)
+        2. ``facebook_reel_description_template`` rendered with game_info
+        3. Empty string
+        """
+        render_meta = context.shared.get("render_metadata", {})
+        description = str(render_meta.get("description", ""))
+        if description:
+            return description
+        template = self._config.get("facebook_reel_description_template", "")
+        if template:
+            return self._render_template(template)
+        return ""
+
+    def _build_caption(self, context: HookContext | None = None) -> str:
+        """Build a Reel caption from render metadata, template, or game info.
+
+        Resolution order:
+        1. ``context.shared["render_metadata"]["description"]`` (AI-generated)
+        2. ``reel_caption_template`` rendered with game_info
+        3. ``_build_title(game_info)`` fallback
+        """
+        if context is not None:
+            render_meta = context.shared.get("render_metadata", {})
+            description = str(render_meta.get("description", ""))
+            if description:
+                return description
+        template = self._config.get("reel_caption_template", "")
+        if not template:
+            if self._game_info is not None:
+                return self._build_title(self._game_info)
+            return ""
+        return self._render_template(template)
+
+    def _build_comment(self) -> str:
+        """Build a comment message from the template and game info."""
+        template = self._config.get("instagram_comment_template", "")
+        if not template:
+            return ""
+        return self._render_template(template)
+
+    def _render_template(self, template: str) -> str:
+        """Render a template string with game info substitution."""
+        game_info = self._game_info
+        values: dict[str, str] = {
+            "home_team": getattr(game_info, "home_team", "") if game_info else "",
+            "away_team": getattr(game_info, "away_team", "") if game_info else "",
+            "date": getattr(game_info, "date", "") if game_info else "",
+            "venue": getattr(game_info, "venue", "") if game_info else "",
+            "sport": getattr(game_info, "sport", "") if game_info else "",
+        }
+
+        class SafeDict(dict[str, str]):
+            def __missing__(self, key: str) -> str:
+                return ""
+
+        return template.format_map(SafeDict(values))
+
     def on_game_finish(self, context: HookContext) -> None:
         """Handle ``ON_GAME_FINISH`` — reset cached state."""
         self._access_token = None
         self._game_info = None
         self._livestream_id = None
+        self._published_reel_id = None
 
     @staticmethod
     def _compute_event_params(game_info: object) -> str:

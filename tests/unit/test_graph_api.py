@@ -13,8 +13,10 @@ import pytest
 from reeln_meta_plugin.graph_api import (
     GraphAPIError,
     format_meta_error,
+    http_get,
     http_post,
     http_post_multipart,
+    http_post_rupload,
 )
 
 
@@ -85,6 +87,81 @@ class TestHttpPost:
             mock_urlopen.return_value.__enter__ = lambda s: fake_response
             mock_urlopen.return_value.__exit__ = lambda s, *a: None
             http_post("https://example.com", {"key": "val"})
+
+
+class TestHttpGet:
+    def test_success(self) -> None:
+        fake_response = BytesIO(b'{"status_code": "FINISHED"}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            result = http_get("https://example.com", {"fields": "status_code"})
+
+        assert result == {"status_code": "FINISHED"}
+
+        # Verify it's a GET request with query params in the URL
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_method() == "GET"
+        assert "fields=status_code" in request.full_url
+
+    def test_empty_params(self) -> None:
+        fake_response = BytesIO(b'{"ok": true}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            result = http_get("https://example.com", {})
+
+        assert result == {"ok": True}
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "https://example.com"
+
+    def test_http_error(self) -> None:
+        error_body = json.dumps({
+            "error": {"message": "Invalid token", "type": "OAuthException", "code": 190}
+        }).encode()
+        exc = urllib.error.HTTPError(
+            "https://example.com", 400, "Bad Request", {}, BytesIO(error_body)  # type: ignore[arg-type]
+        )
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match=r"OAuthException.*190.*Invalid token"),
+        ):
+            http_get("https://example.com", {"key": "val"})
+
+    def test_http_error_empty_body(self) -> None:
+        exc = urllib.error.HTTPError(
+            "https://example.com", 401, "Unauthorized", {}, None  # type: ignore[arg-type]
+        )
+        exc.fp = None  # type: ignore[assignment]
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match="HTTP 401"),
+        ):
+            http_get("https://example.com", {"key": "val"})
+
+    def test_url_error(self) -> None:
+        exc = urllib.error.URLError("Connection refused")
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match=r"Request failed.*Connection refused"),
+        ):
+            http_get("https://example.com", {"key": "val"})
+
+    def test_invalid_json_response(self) -> None:
+        fake_response = BytesIO(b"not json at all")
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen,
+            pytest.raises(GraphAPIError, match="Invalid JSON response"),
+        ):
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            http_get("https://example.com", {"key": "val"})
 
 
 class TestHttpPostMultipart:
@@ -188,6 +265,109 @@ class TestHttpPostMultipart:
 
         body = mock_urlopen.call_args[0][0].data
         assert b"image/jpeg" in body
+
+
+class TestHttpPostRupload:
+    def test_success_with_file_url(self) -> None:
+        fake_response = BytesIO(b'{"success": true}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            result = http_post_rupload(
+                "https://rupload.facebook.com/video-upload/v24.0/123",
+                "my-token",
+                file_url="https://cdn.example.com/clip.mp4",
+            )
+
+        assert result == {"success": True}
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_method() == "POST"
+        assert request.get_header("Authorization") == "OAuth my-token"
+        assert request.get_header("File_url") == "https://cdn.example.com/clip.mp4"
+
+    def test_success_without_file_url(self) -> None:
+        fake_response = BytesIO(b'{"success": true}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            result = http_post_rupload(
+                "https://rupload.facebook.com/v1", "tok",
+            )
+
+        assert result == {"success": True}
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_header("Authorization") == "OAuth tok"
+        assert request.get_header("File_url") is None
+
+    def test_http_error(self) -> None:
+        error_body = json.dumps({
+            "error": {"message": "Upload failed", "type": "GraphMethodException", "code": 100}
+        }).encode()
+        exc = urllib.error.HTTPError(
+            "https://rupload.facebook.com/v1", 400, "Bad Request", {}, BytesIO(error_body)  # type: ignore[arg-type]
+        )
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match=r"GraphMethodException.*Upload failed"),
+        ):
+            http_post_rupload("https://rupload.facebook.com/v1", "tok", file_url="https://cdn.example.com/v.mp4")
+
+    def test_http_error_empty_body(self) -> None:
+        exc = urllib.error.HTTPError(
+            "https://rupload.facebook.com/v1", 500, "Server Error", {}, None  # type: ignore[arg-type]
+        )
+        exc.fp = None  # type: ignore[assignment]
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match="HTTP 500"),
+        ):
+            http_post_rupload("https://rupload.facebook.com/v1", "tok")
+
+    def test_url_error(self) -> None:
+        exc = urllib.error.URLError("Connection refused")
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen", side_effect=exc),
+            pytest.raises(GraphAPIError, match=r"Request failed.*Connection refused"),
+        ):
+            http_post_rupload("https://rupload.facebook.com/v1", "tok")
+
+    def test_invalid_json_response(self) -> None:
+        fake_response = BytesIO(b"not json")
+
+        with (
+            patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen,
+            pytest.raises(GraphAPIError, match="Invalid JSON response"),
+        ):
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            http_post_rupload("https://rupload.facebook.com/v1", "tok")
+
+    def test_timeout_is_120s(self) -> None:
+        fake_response = BytesIO(b'{"success": true}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            http_post_rupload("https://rupload.facebook.com/v1", "tok")
+
+        assert mock_urlopen.call_args[1]["timeout"] == 120
+
+    def test_empty_body(self) -> None:
+        fake_response = BytesIO(b'{"success": true}')
+
+        with patch("reeln_meta_plugin.graph_api.urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.return_value.__enter__ = lambda s: fake_response
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+            http_post_rupload("https://rupload.facebook.com/v1", "tok")
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.data == b""
 
 
 class TestFormatMetaError:
