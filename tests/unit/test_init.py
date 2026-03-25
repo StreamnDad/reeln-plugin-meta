@@ -8,7 +8,7 @@ import reeln_meta_plugin
 class TestPackageExports:
     def test_version_string(self) -> None:
         assert isinstance(reeln_meta_plugin.__version__, str)
-        assert reeln_meta_plugin.__version__ == "0.7.0"
+        assert reeln_meta_plugin.__version__ == "0.9.0"
 
     def test_meta_plugin_export(self) -> None:
         assert hasattr(reeln_meta_plugin, "MetaPlugin")

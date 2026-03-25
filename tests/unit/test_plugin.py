@@ -12,8 +12,11 @@ from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
 from reeln_meta_plugin.auth import AuthError
+from reeln_meta_plugin.comments import CommentError, CommentResult
+from reeln_meta_plugin.facebook_reels import FacebookReelsError, ReelStartResult
 from reeln_meta_plugin.livestream import LivestreamError, LivestreamResult
 from reeln_meta_plugin.plugin import MetaPlugin
+from reeln_meta_plugin.reels import ReelContainerResult, ReelsError
 from tests.conftest import FakeGameInfo
 
 
@@ -24,7 +27,7 @@ class TestMetaPluginAttributes:
 
     def test_version(self) -> None:
         plugin = MetaPlugin()
-        assert plugin.version == "0.7.0"
+        assert plugin.version == "0.9.0"
 
     def test_api_version(self) -> None:
         plugin = MetaPlugin()
@@ -98,6 +101,72 @@ class TestMetaPluginConfigSchema:
         assert field is not None
         assert field.default is False
 
+    def test_instagram_account_id_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("instagram_account_id")
+        assert field is not None
+        assert field.default == ""
+
+    def test_publish_reels_default_false(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("publish_reels")
+        assert field is not None
+        assert field.default is False
+
+    def test_publish_facebook_reels_default_false(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("publish_facebook_reels")
+        assert field is not None
+        assert field.default is False
+
+    def test_facebook_reel_description_template_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("facebook_reel_description_template")
+        assert field is not None
+        assert field.default == ""
+
+    def test_post_instagram_comment_default_false(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("post_instagram_comment")
+        assert field is not None
+        assert field.default is False
+
+    def test_reel_caption_template_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("reel_caption_template")
+        assert field is not None
+        assert field.default == ""
+
+    def test_instagram_comment_template_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("instagram_comment_template")
+        assert field is not None
+        assert field.default == ""
+
+    def test_reel_share_to_feed_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("reel_share_to_feed")
+        assert field is not None
+        assert field.default is True
+
+    def test_reel_thumb_offset_ms_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("reel_thumb_offset_ms")
+        assert field is not None
+        assert field.default == 0
+
+    def test_reel_poll_interval_seconds_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("reel_poll_interval_seconds")
+        assert field is not None
+        assert field.default == 5
+
+    def test_reel_poll_max_attempts_default(self) -> None:
+        schema = MetaPlugin.config_schema
+        field = schema.field_by_name("reel_poll_max_attempts")
+        assert field is not None
+        assert field.default == 60
+
 
 class TestMetaPluginInit:
     def test_no_config(self) -> None:
@@ -106,6 +175,7 @@ class TestMetaPluginInit:
         assert plugin._access_token is None
         assert plugin._game_info is None
         assert plugin._livestream_id is None
+        assert plugin._published_reel_id is None
 
     def test_empty_config(self) -> None:
         plugin = MetaPlugin({})
@@ -134,6 +204,12 @@ class TestMetaPluginRegister:
         registry = HookRegistry()
         plugin.register(registry)
         assert registry.has_handlers(Hook.ON_GAME_FINISH)
+
+    def test_registers_post_render(self) -> None:
+        plugin = MetaPlugin()
+        registry = HookRegistry()
+        plugin.register(registry)
+        assert registry.has_handlers(Hook.POST_RENDER)
 
 
 class TestEnsureAuth:
@@ -1101,6 +1177,15 @@ class TestOnGameFinish:
 
         assert plugin._livestream_id is None
 
+    def test_resets_published_reel_id(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        plugin._published_reel_id = "media-123"
+        context = HookContext(hook=Hook.ON_GAME_FINISH, data={})
+
+        plugin.on_game_finish(context)
+
+        assert plugin._published_reel_id is None
+
     def test_allows_re_auth_after_reset(self, plugin_config: dict[str, Any]) -> None:
         """After on_game_finish, _ensure_auth reads the token again."""
         plugin = MetaPlugin(plugin_config)
@@ -1114,6 +1199,706 @@ class TestOnGameFinish:
 
         assert token == "new-token"
         mock_read.assert_called_once()
+
+
+_FAKE_CONTAINER = ReelContainerResult(container_id="container-123")
+
+
+class TestOnPostRenderDisabled:
+    def test_both_flags_disabled(self, plugin_config: dict[str, Any]) -> None:
+        plugin = MetaPlugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with patch("reeln_meta_plugin.plugin.reels.create_reel_container") as mock_create:
+            plugin.on_post_render(context)
+
+        mock_create.assert_not_called()
+
+    def test_only_publish_reels_disabled(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config["post_instagram_comment"] = False
+        plugin_config["publish_reels"] = False
+        plugin = MetaPlugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with patch("reeln_meta_plugin.plugin.reels.create_reel_container") as mock_create:
+            plugin.on_post_render(context)
+
+        mock_create.assert_not_called()
+
+
+class TestOnPostRenderReels:
+    def _reels_plugin(self, plugin_config: dict[str, Any]) -> MetaPlugin:
+        plugin_config.update({
+            "publish_reels": True,
+            "instagram_account_id": "ig-456",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        return plugin
+
+    def test_full_flow(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://www.instagram.com/reel/abc/",
+            ),
+        ):
+            plugin.on_post_render(context)
+
+        assert context.shared["reels"]["meta"] == "https://www.instagram.com/reel/abc/"
+        assert plugin._published_reel_id == "media-789"
+
+    def test_missing_ig_account_id(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin_config["publish_reels"] = True
+        # No instagram_account_id
+        plugin = MetaPlugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_render(context)
+
+        assert "instagram_account_id not configured" in caplog.text
+
+    def test_missing_video_url(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_render(context)
+
+        assert "no video_url" in caplog.text
+
+    def test_auth_failure(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config.update({
+            "publish_reels": True,
+            "instagram_account_id": "ig-456",
+        })
+        plugin = MetaPlugin(plugin_config)
+        # No cached token, mock auth to fail
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.auth.read_token",
+                side_effect=AuthError("bad token"),
+            ),
+            patch("reeln_meta_plugin.plugin.reels.create_reel_container") as mock_create,
+        ):
+            plugin.on_post_render(context)
+
+        mock_create.assert_not_called()
+
+    def test_dry_run(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin_config["dry_run"] = True
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.reels.create_reel_container") as mock_create,
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        mock_create.assert_not_called()
+        assert "DRY RUN" in caplog.text
+        assert "would publish Reel" in caplog.text
+
+    def test_container_creation_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                side_effect=ReelsError("api error"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Reel container creation failed" in caplog.text
+        assert plugin._published_reel_id is None
+
+    def test_polling_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.poll_container_status",
+                side_effect=ReelsError("timed out"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Reel container polling failed" in caplog.text
+
+    def test_publish_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                side_effect=ReelsError("publish error"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Reel publish failed" in caplog.text
+
+    def test_permalink_failure_nonfatal(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                side_effect=ReelsError("permalink error"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "permalink retrieval failed" in caplog.text
+        # Reel still counts as published
+        assert plugin._published_reel_id == "media-789"
+        assert context.shared["reels"]["meta"] == ""
+
+    def test_caption_from_template(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        plugin._config["reel_caption_template"] = "{home_team} vs {away_team} highlights"
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ) as mock_create,
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        assert mock_create.call_args[1]["caption"] == "Eagles vs Hawks highlights"
+
+    def test_caption_fallback_to_title(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        # No caption template, should fall back to _build_title
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ) as mock_create,
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Eagles vs Hawks" in mock_create.call_args[1]["caption"]
+
+    def test_caption_fallback_no_game_info(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        plugin._game_info = None
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ) as mock_create,
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        assert mock_create.call_args[1]["caption"] == ""
+
+    def test_custom_reel_settings(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        plugin._config.update({
+            "reel_share_to_feed": False,
+            "reel_thumb_offset_ms": 3000,
+            "reel_poll_max_attempts": 10,
+            "reel_poll_interval_seconds": 2,
+            "graph_api_version": "v23.0",
+        })
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ) as mock_create,
+            patch(
+                "reeln_meta_plugin.plugin.reels.poll_container_status",
+                return_value="FINISHED",
+            ) as mock_poll,
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        create_kwargs = mock_create.call_args[1]
+        assert create_kwargs["share_to_feed"] is False
+        assert create_kwargs["thumb_offset"] == 3000
+        assert create_kwargs["api_version"] == "v23.0"
+
+        poll_kwargs = mock_poll.call_args[1]
+        assert poll_kwargs["max_attempts"] == 10
+        assert poll_kwargs["poll_interval"] == 2.0
+
+    def test_logs_info_on_success(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://www.instagram.com/reel/abc/",
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        assert "published Reel" in caplog.text
+        assert "media-789" in caplog.text
+
+
+class TestOnPostRenderComments:
+    def _comment_plugin(self, plugin_config: dict[str, Any]) -> MetaPlugin:
+        plugin_config.update({
+            "post_instagram_comment": True,
+            "instagram_account_id": "ig-456",
+            "instagram_comment_template": "Great game, {home_team}!",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        plugin._published_reel_id = "media-789"
+        return plugin
+
+    def test_posts_comment(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with patch(
+            "reeln_meta_plugin.plugin.comments.post_comment",
+            return_value=CommentResult(comment_id="cmt-1"),
+        ) as mock_comment:
+            plugin.on_post_render(context)
+
+        mock_comment.assert_called_once_with(
+            media_id="media-789",
+            access_token="test-access-token-123",
+            message="Great game, Eagles!",
+            api_version="v24.0",
+        )
+
+    def test_skips_when_no_published_reel(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        plugin._published_reel_id = None
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment:
+            plugin.on_post_render(context)
+
+        mock_comment.assert_not_called()
+
+    def test_skips_when_template_empty(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        plugin._config["instagram_comment_template"] = ""
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with (
+            patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment,
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        mock_comment.assert_not_called()
+        assert "instagram_comment_template is empty" in caplog.text
+
+    def test_dry_run(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        plugin._config["dry_run"] = True
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with (
+            patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment,
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        mock_comment.assert_not_called()
+        assert "DRY RUN" in caplog.text
+        assert "would post comment" in caplog.text
+
+    def test_comment_error_nonfatal(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.comments.post_comment",
+                side_effect=CommentError("api error"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "comment posting failed" in caplog.text
+
+    def test_logs_info_on_success(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plugin = self._comment_plugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={})
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.comments.post_comment",
+                return_value=CommentResult(comment_id="cmt-1"),
+            ),
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        assert "posted comment" in caplog.text
+        assert "cmt-1" in caplog.text
+
+
+class TestOnPostRenderBothEnabled:
+    def test_reels_then_comment(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config.update({
+            "publish_reels": True,
+            "post_instagram_comment": True,
+            "instagram_account_id": "ig-456",
+            "instagram_comment_template": "GG!",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+            patch(
+                "reeln_meta_plugin.plugin.comments.post_comment",
+                return_value=CommentResult(comment_id="cmt-1"),
+            ) as mock_comment,
+        ):
+            plugin.on_post_render(context)
+
+        # Reel was published and comment was posted on it
+        assert plugin._published_reel_id == "media-789"
+        mock_comment.assert_called_once()
+        assert mock_comment.call_args[1]["media_id"] == "media-789"
+
+    def test_reel_fails_comment_skipped(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config.update({
+            "publish_reels": True,
+            "post_instagram_comment": True,
+            "instagram_account_id": "ig-456",
+            "instagram_comment_template": "GG!",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                side_effect=ReelsError("api error"),
+            ),
+            patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment,
+        ):
+            plugin.on_post_render(context)
+
+        # No reel → no comment
+        mock_comment.assert_not_called()
+
+
+class TestOnPostRenderGameInfoFromHookData:
+    def test_caches_game_info_from_hook_data(self, plugin_config: dict[str, Any]) -> None:
+        """When create_livestream is disabled, game_info comes from hook data."""
+        plugin_config.update({
+            "publish_reels": True,
+            "instagram_account_id": "ig-456",
+            "create_livestream": False,
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        assert plugin._game_info is None
+
+        game_info = FakeGameInfo(home_team="Storm", away_team="Thunder")
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={"game_info": game_info},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=ReelContainerResult(container_id="c-1"),
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-1"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        assert plugin._game_info is game_info
+
+    def test_does_not_overwrite_existing_game_info(self, plugin_config: dict[str, Any]) -> None:
+        plugin_config.update({
+            "publish_reels": True,
+            "instagram_account_id": "ig-456",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        original_info = FakeGameInfo(home_team="Eagles")
+        plugin._game_info = original_info
+
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={"game_info": FakeGameInfo(home_team="Storm")},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=ReelContainerResult(container_id="c-1"),
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-1"),
+            patch("reeln_meta_plugin.plugin.reels.get_permalink", return_value="https://ig.com/r/1"),
+        ):
+            plugin.on_post_render(context)
+
+        assert plugin._game_info is original_info
+
+
+class TestBuildCaption:
+    def test_with_template(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} vs {away_team}"})
+        plugin._game_info = FakeGameInfo()
+        assert plugin._build_caption() == "Eagles vs Hawks"
+
+    def test_fallback_to_title(self) -> None:
+        plugin = MetaPlugin({})
+        plugin._game_info = FakeGameInfo()
+        assert "Eagles vs Hawks" in plugin._build_caption()
+
+    def test_no_game_info_no_template(self) -> None:
+        plugin = MetaPlugin({})
+        assert plugin._build_caption() == ""
+
+    def test_unknown_placeholder_safe(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} {unknown_field}"})
+        plugin._game_info = FakeGameInfo()
+        assert plugin._build_caption() == "Eagles "
+
+    def test_render_metadata_preferred(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} vs {away_team}"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "AI Title", "description": "AI generated caption"}},
+        )
+        assert plugin._build_caption(context) == "AI generated caption"
+
+    def test_render_metadata_empty_falls_through(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} vs {away_team}"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "AI Title", "description": ""}},
+        )
+        assert plugin._build_caption(context) == "Eagles vs Hawks"
+
+    def test_render_metadata_missing_falls_through(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} vs {away_team}"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+        assert plugin._build_caption(context) == "Eagles vs Hawks"
+
+    def test_no_context_uses_template(self) -> None:
+        plugin = MetaPlugin({"reel_caption_template": "{home_team} vs {away_team}"})
+        plugin._game_info = FakeGameInfo()
+        assert plugin._build_caption() == "Eagles vs Hawks"
+
+
+class TestBuildComment:
+    def test_with_template(self) -> None:
+        plugin = MetaPlugin({"instagram_comment_template": "Go {home_team}!"})
+        plugin._game_info = FakeGameInfo()
+        assert plugin._build_comment() == "Go Eagles!"
+
+    def test_empty_template(self) -> None:
+        plugin = MetaPlugin({})
+        assert plugin._build_comment() == ""
+
+    def test_no_game_info(self) -> None:
+        plugin = MetaPlugin({"instagram_comment_template": "{home_team} rules"})
+        assert plugin._build_comment() == " rules"
+
+
+class TestRenderTemplate:
+    def test_all_fields(self) -> None:
+        plugin = MetaPlugin({})
+        plugin._game_info = FakeGameInfo(
+            home_team="Eagles",
+            away_team="Hawks",
+            date="2026-01-15",
+            venue="Arena",
+            sport="hockey",
+        )
+        result = plugin._render_template(
+            "{home_team} vs {away_team} on {date} at {venue} ({sport})"
+        )
+        assert result == "Eagles vs Hawks on 2026-01-15 at Arena (hockey)"
+
+    def test_missing_key_returns_empty(self) -> None:
+        plugin = MetaPlugin({})
+        plugin._game_info = FakeGameInfo()
+        result = plugin._render_template("{nonexistent}")
+        assert result == ""
 
 
 class TestIntegrationWithRegistry:
@@ -1162,3 +1947,450 @@ class TestIntegrationWithRegistry:
         assert plugin._access_token is None
         assert plugin._game_info is None
         assert plugin._livestream_id is None
+
+
+# ------------------------------------------------------------------
+# Facebook Reels
+# ------------------------------------------------------------------
+
+_FAKE_FB_START = ReelStartResult(
+    video_id="fb-vid-123",
+    upload_url="https://rupload.facebook.com/video-upload/v24.0/fb-vid-123",
+)
+
+
+class TestOnPostRenderFacebookReels:
+    def _fb_reels_plugin(self, plugin_config: dict[str, Any]) -> MetaPlugin:
+        plugin_config.update({
+            "publish_facebook_reels": True,
+            "page_id": "pg-123",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        return plugin
+
+    def test_full_flow(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ) as mock_start,
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video") as mock_upload,
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel") as mock_finish,
+        ):
+            plugin.on_post_render(context)
+
+        mock_start.assert_called_once()
+        mock_upload.assert_called_once()
+        assert mock_upload.call_args[1]["video_url"] == "https://cdn.example.com/clip.mp4"
+        mock_finish.assert_called_once()
+        assert context.shared["facebook_reels"]["meta"] == "fb-vid-123"
+
+    def test_passes_correct_params(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        plugin._config["graph_api_version"] = "v25.0"
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ) as mock_start,
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel") as mock_finish,
+        ):
+            plugin.on_post_render(context)
+
+        start_kwargs = mock_start.call_args[1]
+        assert start_kwargs["page_id"] == "pg-123"
+        assert start_kwargs["access_token"] == "test-access-token-123"
+        assert start_kwargs["api_version"] == "v25.0"
+
+        finish_kwargs = mock_finish.call_args[1]
+        assert finish_kwargs["page_id"] == "pg-123"
+        assert finish_kwargs["video_id"] == "fb-vid-123"
+
+    def test_missing_video_url(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_render(context)
+
+        assert "no video_url" in caplog.text
+
+    def test_missing_page_id(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        plugin._config["page_id"] = ""
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_render(context)
+
+        assert "page_id not configured" in caplog.text
+
+    def test_start_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                side_effect=FacebookReelsError("start failed"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Facebook Reel start failed" in caplog.text
+        assert "facebook_reels" not in context.shared
+
+    def test_upload_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.upload_reel_video",
+                side_effect=FacebookReelsError("upload failed"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Facebook Reel upload failed" in caplog.text
+
+    def test_finish_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.finish_reel",
+                side_effect=FacebookReelsError("publish failed"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Facebook Reel publish failed" in caplog.text
+
+    def test_poll_failure(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.poll_reel_status",
+                side_effect=FacebookReelsError("poll timeout"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            plugin.on_post_render(context)
+
+        assert "Facebook Reel polling failed" in caplog.text
+
+    def test_dry_run(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        plugin._config["dry_run"] = True
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch("reeln_meta_plugin.plugin.facebook_reels.start_reel_upload") as mock_start,
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        mock_start.assert_not_called()
+        assert "DRY RUN" in caplog.text
+        assert "would publish Facebook Reel" in caplog.text
+
+    def test_uses_render_metadata_for_title_and_description(
+        self, plugin_config: dict[str, Any],
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={
+                "video_url": "https://cdn.example.com/clip.mp4",
+                "render_metadata": {"title": "AI Title", "description": "AI Desc"},
+            },
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel") as mock_finish,
+        ):
+            plugin.on_post_render(context)
+
+        finish_kwargs = mock_finish.call_args[1]
+        assert finish_kwargs["title"] == "AI Title"
+        assert finish_kwargs["description"] == "AI Desc"
+
+    def test_falls_back_to_game_info_title(
+        self, plugin_config: dict[str, Any],
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel") as mock_finish,
+        ):
+            plugin.on_post_render(context)
+
+        finish_kwargs = mock_finish.call_args[1]
+        assert "Eagles vs Hawks" in finish_kwargs["title"]
+        assert finish_kwargs["description"] == ""
+
+    def test_uses_description_template(
+        self, plugin_config: dict[str, Any],
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        plugin._config["facebook_reel_description_template"] = "{home_team} highlights!"
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel") as mock_finish,
+        ):
+            plugin.on_post_render(context)
+
+        finish_kwargs = mock_finish.call_args[1]
+        assert finish_kwargs["description"] == "Eagles highlights!"
+
+    def test_uses_poll_config(self, plugin_config: dict[str, Any]) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        plugin._config["reel_poll_max_attempts"] = 10
+        plugin._config["reel_poll_interval_seconds"] = 2
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete") as mock_poll,
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+        ):
+            plugin.on_post_render(context)
+
+        poll_kwargs = mock_poll.call_args[1]
+        assert poll_kwargs["max_attempts"] == 10
+        assert poll_kwargs["poll_interval"] == 2.0
+
+    def test_logs_info_on_success(
+        self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = self._fb_reels_plugin(plugin_config)
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            caplog.at_level(logging.INFO),
+        ):
+            plugin.on_post_render(context)
+
+        assert "published Facebook Reel" in caplog.text
+        assert "fb-vid-123" in caplog.text
+
+    def test_ig_not_required_for_fb_reels(self, plugin_config: dict[str, Any]) -> None:
+        """Facebook Reels should work without instagram_account_id configured."""
+        plugin_config.update({
+            "publish_facebook_reels": True,
+            "publish_reels": False,
+            "page_id": "pg-123",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status", return_value="complete"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+        ):
+            plugin.on_post_render(context)
+
+        assert context.shared["facebook_reels"]["meta"] == "fb-vid-123"
+
+
+class TestBuildFacebookReelTitle:
+    def test_render_metadata_preferred(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "AI Title", "description": "AI Desc"}},
+        )
+        assert plugin._build_facebook_reel_title(context) == "AI Title"
+
+    def test_falls_back_to_game_info(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+        assert "Eagles vs Hawks" in plugin._build_facebook_reel_title(context)
+
+    def test_no_game_info(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1"})
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+        assert plugin._build_facebook_reel_title(context) == ""
+
+    def test_empty_render_metadata_title_falls_through(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "", "description": "Desc"}},
+        )
+        assert "Eagles vs Hawks" in plugin._build_facebook_reel_title(context)
+
+
+class TestBuildFacebookReelDescription:
+    def test_render_metadata_preferred(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1", "facebook_reel_description_template": "{home_team}!"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "T", "description": "AI Desc"}},
+        )
+        assert plugin._build_facebook_reel_description(context) == "AI Desc"
+
+    def test_template_fallback(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1", "facebook_reel_description_template": "{home_team} highlights!"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+        assert plugin._build_facebook_reel_description(context) == "Eagles highlights!"
+
+    def test_no_render_metadata_no_template(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1"})
+        context = HookContext(hook=Hook.POST_RENDER, data={}, shared={})
+        assert plugin._build_facebook_reel_description(context) == ""
+
+    def test_empty_render_metadata_falls_to_template(self) -> None:
+        plugin = MetaPlugin({"page_id": "pg-1", "facebook_reel_description_template": "Go {home_team}!"})
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"render_metadata": {"title": "T", "description": ""}},
+        )
+        assert plugin._build_facebook_reel_description(context) == "Go Eagles!"

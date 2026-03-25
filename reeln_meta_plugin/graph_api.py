@@ -115,6 +115,86 @@ def http_post_multipart(
         raise GraphAPIError(f"Invalid JSON response: {response_body[:200]}") from exc
 
 
+def http_get(url: str, params: dict[str, str]) -> dict[str, Any]:
+    """Send a GET request with query parameters and return parsed JSON.
+
+    Args:
+        url: API endpoint URL.
+        params: Query string parameters.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        GraphAPIError: On HTTP or parsing errors.
+    """
+    query = urllib.parse.urlencode(params)
+    full_url = f"{url}?{query}" if query else url
+    request = urllib.request.Request(full_url, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode() if exc.fp else ""
+        detail = format_meta_error(error_body)
+        raise GraphAPIError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GraphAPIError(f"Request failed: {exc.reason}") from exc
+
+    try:
+        return json.loads(body)  # type: ignore[no-any-return]
+    except json.JSONDecodeError as exc:
+        raise GraphAPIError(f"Invalid JSON response: {body[:200]}") from exc
+
+
+def http_post_rupload(
+    url: str,
+    access_token: str,
+    *,
+    file_url: str = "",
+) -> dict[str, Any]:
+    """Send a POST to Facebook's rupload endpoint and return parsed JSON.
+
+    The rupload host (``rupload.facebook.com``) uses OAuth header
+    authentication and accepts an optional ``file_url`` header to instruct
+    Meta's servers to fetch the video from a CDN URL.
+
+    Args:
+        url: Full rupload URL (e.g. ``https://rupload.facebook.com/video-upload/v24.0/{video_id}``).
+        access_token: Page Access Token.
+        file_url: Public CDN URL for the video file.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        GraphAPIError: On HTTP or parsing errors.
+    """
+    headers: dict[str, str] = {
+        "Authorization": f"OAuth {access_token}",
+    }
+    if file_url:
+        headers["file_url"] = file_url
+
+    request = urllib.request.Request(url, data=b"", headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            body = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode() if exc.fp else ""
+        detail = format_meta_error(error_body)
+        raise GraphAPIError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GraphAPIError(f"Request failed: {exc.reason}") from exc
+
+    try:
+        return json.loads(body)  # type: ignore[no-any-return]
+    except json.JSONDecodeError as exc:
+        raise GraphAPIError(f"Invalid JSON response: {body[:200]}") from exc
+
+
 def format_meta_error(details: str) -> str:
     """Parse a Meta API error response into a user-friendly message.
 

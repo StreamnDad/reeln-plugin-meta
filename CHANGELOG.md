@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.9.0] - 2026-03-25
+
+### Added
+
+- `facebook_reels.py` module — Facebook Page Reels publishing via four-step upload (start → rupload with CDN URL → finish → poll)
+- `publish_facebook_reels` feature flag — enables Facebook Page Reel publishing on `POST_RENDER` hook
+- `facebook_reel_description_template` config field — template for Facebook Reel descriptions
+- `http_post_rupload()` in `graph_api.py` — POST helper for `rupload.facebook.com` with OAuth header auth and `file_url` header
+- Facebook Reel title/description resolution: prefers `render_metadata` (AI-generated), falls back to template or game info
+- Shared context output: `context.shared["facebook_reels"]["meta"]` = video_id
+- Dry-run support for Facebook Reel publishing
+- Reel captions now prefer AI-generated description from `context.shared["render_metadata"]["description"]` (set by OpenAI plugin) before falling back to `reel_caption_template` or `_build_title()`
+- `on_post_render` now reads `game_info` from `context.data` when `create_livestream` is disabled, enabling template rendering for Reels/comments without requiring the livestream feature
+
+### Changed
+
+- `on_post_render` now supports three independent publish flags: `publish_reels` (Instagram), `publish_facebook_reels` (Facebook), `post_instagram_comment`
+- Instagram `instagram_account_id` check moved to IG-specific code path — no longer blocks Facebook Reels when IG is unconfigured
+
+## [0.8.0] - 2026-03-24
+
+### Added
+
+- `reels.py` module — Instagram Reels publishing via two-stage container API (create container → poll status → publish → get permalink)
+- `comments.py` module — Instagram comment posting on published media
+- `http_get()` helper in `graph_api.py` — GET requests with query parameters for status polling and permalink retrieval
+- `publish_reels` feature flag — enables Reel publishing on `POST_RENDER` hook
+- `post_instagram_comment` feature flag — enables comment posting on published Reels
+- `POST_RENDER` hook handler (`on_post_render`) — orchestrates Reel publishing and comment posting
+- New config fields: `instagram_account_id`, `reel_caption_template`, `instagram_comment_template`, `reel_share_to_feed`, `reel_thumb_offset_ms`, `reel_poll_interval_seconds`, `reel_poll_max_attempts`
+- Template-based caption and comment generation with `{home_team}`, `{away_team}`, `{date}`, `{venue}`, `{sport}` placeholders
+- Container status polling with configurable timeout (default 5s × 60 attempts = 5 minutes)
+- Permalink retrieval with retry logic (default 3 retries, 2s delay)
+- Shared context output: `context.shared["reels"]["meta"]` = permalink
+- Dry-run support for both Reel publishing and comment posting
+
+### Notes
+
+- Reel publishing requires a publicly accessible `video_url` in `context.shared["video_url"]` (set by a CDN upload plugin)
+- Instagram API uses the same Page Access Token as Facebook Live (IG account must be linked to the Facebook Page)
+
 ## [0.7.0] - 2026-03-15
 
 ### Added
