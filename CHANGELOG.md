@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.10.0] - 2026-04-07
+
+### Added
+
+- `auth_check()` and `auth_refresh()` methods implementing the `Authenticator` protocol — enables `reeln plugins auth meta` for credential verification across Facebook Page and Instagram services
+
 ## [0.9.0] - 2026-03-25
 
 ### Added

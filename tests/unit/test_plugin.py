@@ -27,7 +27,7 @@ class TestMetaPluginAttributes:
 
     def test_version(self) -> None:
         plugin = MetaPlugin()
-        assert plugin.version == "0.9.0"
+        assert plugin.version == "0.10.0"
 
     def test_api_version(self) -> None:
         plugin = MetaPlugin()

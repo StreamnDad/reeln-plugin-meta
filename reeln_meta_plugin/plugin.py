@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from reeln.models.auth import AuthCheckResult, AuthStatus
 from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
@@ -24,7 +25,7 @@ class MetaPlugin:
     """
 
     name: str = "meta"
-    version: str = "0.9.0"
+    version: str = "0.10.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -701,6 +702,143 @@ class MetaPlugin:
         # naive datetime → .timestamp() assumes local timezone
         timestamp = int(local_dt.timestamp())
         return str(timestamp)
+
+    def auth_check(self) -> list[AuthCheckResult]:
+        """Test Meta authentication and return check results.
+
+        Returns one result per service: Facebook Page, and optionally
+        Instagram (if ``instagram_account_id`` is configured).
+        """
+        from reeln_meta_plugin import graph_api
+
+        results: list[AuthCheckResult] = []
+
+        token_file_str = self._config.get("page_access_token_file")
+        if not token_file_str:
+            results.append(
+                AuthCheckResult(
+                    service="Facebook Page",
+                    status=AuthStatus.NOT_CONFIGURED,
+                    message="page_access_token_file not configured",
+                    hint="Set page_access_token_file in plugin config",
+                )
+            )
+            if self._config.get("instagram_account_id"):
+                results.append(
+                    AuthCheckResult(
+                        service="Instagram",
+                        status=AuthStatus.NOT_CONFIGURED,
+                        message="page_access_token_file not configured",
+                        hint="Set page_access_token_file in plugin config",
+                    )
+                )
+            return results
+
+        token_path = Path(token_file_str)
+
+        try:
+            token = auth.read_token(token_path)
+        except auth.AuthError as exc:
+            results.append(
+                AuthCheckResult(
+                    service="Facebook Page",
+                    status=AuthStatus.FAIL,
+                    message=str(exc),
+                    hint="Create a Page Access Token file at the configured path",
+                )
+            )
+            if self._config.get("instagram_account_id"):
+                results.append(
+                    AuthCheckResult(
+                        service="Instagram",
+                        status=AuthStatus.FAIL,
+                        message=str(exc),
+                        hint="Create a Page Access Token file at the configured path",
+                    )
+                )
+            return results
+
+        api_version = self._config.get("graph_api_version", "v24.0")
+        page_id = self._config.get("page_id")
+
+        # --- Facebook Page check ---
+        if not page_id:
+            results.append(
+                AuthCheckResult(
+                    service="Facebook Page",
+                    status=AuthStatus.NOT_CONFIGURED,
+                    message="page_id not configured",
+                    hint="Set page_id in plugin config",
+                )
+            )
+        else:
+            try:
+                data = graph_api.http_get(
+                    f"https://graph.facebook.com/{api_version}/{page_id}",
+                    {"fields": "name,id", "access_token": token},
+                )
+                page_name = str(data.get("name", page_id))
+                results.append(
+                    AuthCheckResult(
+                        service="Facebook Page",
+                        status=AuthStatus.OK,
+                        message="Token valid",
+                        identity=page_name,
+                    )
+                )
+            except graph_api.GraphAPIError as exc:
+                results.append(
+                    AuthCheckResult(
+                        service="Facebook Page",
+                        status=AuthStatus.FAIL,
+                        message=str(exc),
+                        hint="Generate a new Page Access Token at https://developers.facebook.com/tools/explorer/",
+                    )
+                )
+
+        # --- Instagram check ---
+        ig_user_id = self._config.get("instagram_account_id")
+        if ig_user_id:
+            try:
+                data = graph_api.http_get(
+                    f"https://graph.facebook.com/{api_version}/{ig_user_id}",
+                    {"fields": "username,name", "access_token": token},
+                )
+                username = str(data.get("username", ig_user_id))
+                results.append(
+                    AuthCheckResult(
+                        service="Instagram",
+                        status=AuthStatus.OK,
+                        message="Token valid",
+                        identity=username,
+                    )
+                )
+            except graph_api.GraphAPIError as exc:
+                results.append(
+                    AuthCheckResult(
+                        service="Instagram",
+                        status=AuthStatus.FAIL,
+                        message=str(exc),
+                        hint="Ensure the Page Access Token has instagram_basic permission",
+                    )
+                )
+
+        return results
+
+    def auth_refresh(self) -> list[AuthCheckResult]:
+        """Attempt to refresh Meta authentication.
+
+        Meta Page Access Tokens are manually generated — there is no
+        automated refresh flow.
+        """
+        return [
+            AuthCheckResult(
+                service="Meta",
+                status=AuthStatus.FAIL,
+                message="Meta tokens cannot be refreshed automatically",
+                hint="Generate a new Page Access Token at https://developers.facebook.com/tools/explorer/",
+            )
+        ]
 
     def _build_title(self, game_info: object) -> str:
         """Build a livestream title from game info."""
