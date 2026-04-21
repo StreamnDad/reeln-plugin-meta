@@ -9,6 +9,7 @@ from typing import Any
 
 from reeln.models.auth import AuthCheckResult, AuthStatus
 from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
+from reeln.plugins.capabilities import UploaderSkipped
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
@@ -201,6 +202,9 @@ class MetaPlugin:
 
     def on_game_init(self, context: HookContext) -> None:
         """Handle ``ON_GAME_INIT`` — create a Facebook Live Video."""
+        if context.data.get("regenerate_image_only", False):
+            return
+
         if not self._config.get("create_livestream"):
             return
 
@@ -337,6 +341,243 @@ class MetaPlugin:
 
         log.info("Meta plugin: updated livestream %s", self._livestream_id)
 
+    def upload(
+        self, path: Path, *, metadata: dict[str, Any] | None = None
+    ) -> str:
+        """Publish Reels to Instagram and/or Facebook from a hosted URL.
+
+        Implements the :class:`reeln.plugins.capabilities.Uploader` protocol
+        so the plugin can be used by ``reeln queue publish`` for truthful
+        per-target status reporting.
+
+        Meta does **not** upload raw files — the Reels API requires a
+        publicly accessible URL. The ``metadata["video_url"]`` key must be
+        populated by an upstream file-hosting uploader (typically
+        cloudflare, which runs first alphabetically). The ``path``
+        argument is accepted to satisfy the protocol but is unused.
+
+        Returns the Instagram permalink when IG publishing is enabled,
+        otherwise the Facebook Reel URL when only FB publishing is
+        enabled. In dry-run mode, returns a sentinel string without
+        hitting the API.
+
+        Raises:
+            UploaderSkipped: when all publish flags are disabled, or when
+                ``metadata["video_url"]`` is missing (cloudflare uploader
+                not enabled or not yet run).
+            RuntimeError: when authentication fails or no configured
+                target (IG account id, Page id) is available.
+            reels.ReelsError / facebook_reels.FacebookReelsError: on
+                upstream API failure (propagated for FAILED status).
+        """
+        del path  # Unused — Meta consumes hosted URLs, not local files.
+        meta = metadata or {}
+
+        publish_ig = bool(self._config.get("publish_reels"))
+        publish_fb = bool(self._config.get("publish_facebook_reels"))
+        post_comment = bool(self._config.get("post_instagram_comment"))
+
+        if not publish_ig and not publish_fb and not post_comment:
+            raise UploaderSkipped(
+                "no meta publishing flags enabled "
+                "(publish_reels / publish_facebook_reels / post_instagram_comment)"
+            )
+
+        video_url = str(meta.get("video_url", ""))
+        if not video_url and (publish_ig or publish_fb):
+            raise UploaderSkipped(
+                "Meta Reels require metadata['video_url'] "
+                "— enable a file-hosting uploader (e.g. cloudflare) first"
+            )
+
+        access_token = self._ensure_auth()
+        if access_token is None:
+            raise RuntimeError(
+                "Meta plugin: authentication failed "
+                "(check page_access_token_file)"
+            )
+
+        # Hydrate _game_info from metadata when the plugin is freshly
+        # instantiated for manual publish (no ON_GAME_INIT run).
+        self._hydrate_game_info_from_metadata(meta)
+
+        api_version = self._config.get("graph_api_version", "v24.0")
+
+        # CRITICAL: collect per-sub-operation results and errors instead
+        # of raising on the first failure. A late-stage failure must NOT
+        # discard a successful earlier publish — otherwise clicking Retry
+        # after a partial success creates duplicate posts on every retry
+        # (e.g. IG succeeds, FB fails → user retries → another duplicate
+        # IG Reel, FB fails again → infinite duplicate-posting loop).
+        errors: list[str] = []
+        ig_permalink = ""
+        fb_page_id = ""
+        fb_video_id = ""
+        requested_publishes = 0
+        succeeded_publishes = 0
+
+        if publish_ig:
+            requested_publishes += 1
+            ig_user_id = self._config.get("instagram_account_id", "")
+            if not ig_user_id:
+                errors.append(
+                    "IG Reel: instagram_account_id not configured"
+                )
+            else:
+                caption = self._build_caption_from_metadata(meta)
+                try:
+                    ig_permalink = self._do_ig_reel_publish(
+                        ig_user_id=ig_user_id,
+                        access_token=access_token,
+                        api_version=api_version,
+                        video_url=video_url,
+                        caption=caption,
+                    )
+                    succeeded_publishes += 1
+                except reels.ReelsError as exc:
+                    errors.append(f"IG Reel: {exc}")
+
+        if publish_fb:
+            requested_publishes += 1
+            fb_page_id = self._config.get("page_id", "")
+            if not fb_page_id:
+                errors.append("Facebook Reel: page_id not configured")
+            else:
+                title = self._build_fb_title_from_metadata(meta)
+                description = self._build_fb_description_from_metadata(meta)
+                try:
+                    fb_video_id = self._do_fb_reel_publish(
+                        page_id=fb_page_id,
+                        access_token=access_token,
+                        api_version=api_version,
+                        video_url=video_url,
+                        title=title,
+                        description=description,
+                    )
+                    succeeded_publishes += 1
+                except facebook_reels.FacebookReelsError as exc:
+                    errors.append(f"Facebook Reel: {exc}")
+
+        if post_comment and self._published_reel_id:
+            message = self._build_comment()
+            if message and not self._config.get("dry_run"):
+                try:
+                    comments.post_comment(
+                        media_id=self._published_reel_id,
+                        access_token=access_token,
+                        message=message,
+                        api_version=api_version,
+                    )
+                except comments.CommentError as exc:
+                    # Comment failure is non-fatal — log and continue so
+                    # the overall publish still reports PUBLISHED.
+                    log.warning(
+                        "Meta plugin: comment posting failed (non-fatal): %s",
+                        exc,
+                    )
+
+        # Decide the overall result:
+        # - If nothing was requested, return the dry-run sentinel.
+        # - If something was requested and everything that was requested
+        #   failed, raise with the collected errors (publish_queue_item
+        #   maps to FAILED).
+        # - If at least one publish succeeded, return its URL and log
+        #   warnings about the partial failures. This is what prevents
+        #   the duplicate-posting loop on retry.
+        if requested_publishes == 0:
+            return (
+                "meta:dry_run" if self._config.get("dry_run") else "meta:published"
+            )
+
+        if succeeded_publishes == 0:
+            raise RuntimeError("; ".join(errors))
+
+        if errors:
+            log.warning(
+                "Meta plugin: partial publish success — %d/%d targets "
+                "published, errors: %s",
+                succeeded_publishes,
+                requested_publishes,
+                "; ".join(errors),
+            )
+
+        # Prefer the IG permalink, fall back to the FB video URL.
+        if ig_permalink:
+            return ig_permalink
+        if fb_video_id:
+            return f"https://facebook.com/{fb_page_id}/videos/{fb_video_id}"
+
+        # Both publishes reported success but neither returned a URL
+        # (dry_run mode or permalink lookup failed) — return the sentinel
+        # so publish_queue_item records PUBLISHED without an empty URL.
+        return "meta:dry_run" if self._config.get("dry_run") else "meta:published"
+
+    def _hydrate_game_info_from_metadata(
+        self, metadata: dict[str, Any]
+    ) -> None:
+        """Populate ``self._game_info`` from a publish metadata dict.
+
+        The manual publish path instantiates plugins fresh, so
+        ``_game_info`` is None and template rendering / fallback titles
+        would otherwise produce empty strings. This builds a minimal
+        stand-in object with only the attributes templates/titles use.
+        """
+        if self._game_info is not None:
+            return
+        if not metadata:
+            return
+
+        class _MetaGameInfo:
+            def __init__(self, **kwargs: Any) -> None:
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        self._game_info = _MetaGameInfo(
+            home_team=str(metadata.get("home_team", "")),
+            away_team=str(metadata.get("away_team", "")),
+            date=str(metadata.get("date", "")),
+            sport=str(metadata.get("sport", "")),
+            venue="",  # Not in build_publish_metadata; template falls back to "".
+            description=str(metadata.get("description", "")),
+        )
+
+    def _build_caption_from_metadata(self, metadata: dict[str, Any]) -> str:
+        """Caption resolution for the manual publish path.
+
+        Mirrors :meth:`_build_caption` but reads from the metadata dict
+        instead of ``context.shared["render_metadata"]``.
+        """
+        description = str(metadata.get("description", ""))
+        if description:
+            return description
+        template = self._config.get("reel_caption_template", "")
+        if template:
+            return self._render_template(template)
+        if self._game_info is not None:
+            return self._build_title(self._game_info)
+        return ""
+
+    def _build_fb_title_from_metadata(self, metadata: dict[str, Any]) -> str:
+        """Facebook Reel title for the manual publish path."""
+        title = str(metadata.get("title", ""))
+        if title:
+            return title
+        if self._game_info is not None:
+            return self._build_title(self._game_info)
+        return ""
+
+    def _build_fb_description_from_metadata(
+        self, metadata: dict[str, Any]
+    ) -> str:
+        """Facebook Reel description for the manual publish path."""
+        description = str(metadata.get("description", ""))
+        if description:
+            return description
+        template = self._config.get("facebook_reel_description_template", "")
+        if template:
+            return self._render_template(template)
+        return ""
+
     def on_post_render(self, context: HookContext) -> None:
         """Handle ``POST_RENDER`` — publish Reels and/or post comment."""
         publish_ig = self._config.get("publish_reels")
@@ -378,7 +619,14 @@ class MetaPlugin:
         access_token: str,
         api_version: str,
     ) -> None:
-        """Execute the full Reel publishing flow."""
+        """Execute the full Reel publishing flow (POST_RENDER wrapper).
+
+        Thin wrapper around :meth:`_do_ig_reel_publish` that reads
+        ``video_url`` from ``context.shared``, swallows
+        :class:`reels.ReelsError` (a failure must never break the
+        render pipeline), and writes the permalink back into
+        ``context.shared["reels"]["meta"]`` on success.
+        """
         video_url = context.shared.get("video_url", "")
         if not video_url:
             log.warning(
@@ -388,6 +636,39 @@ class MetaPlugin:
 
         caption = self._build_caption(context)
 
+        try:
+            permalink = self._do_ig_reel_publish(
+                ig_user_id=ig_user_id,
+                access_token=access_token,
+                api_version=api_version,
+                video_url=str(video_url),
+                caption=caption,
+            )
+        except reels.ReelsError as exc:
+            log.warning("Meta plugin: Reel publish failed: %s", exc)
+            return
+
+        context.shared["reels"] = context.shared.get("reels", {})
+        context.shared["reels"]["meta"] = permalink
+
+    def _do_ig_reel_publish(
+        self,
+        *,
+        ig_user_id: str,
+        access_token: str,
+        api_version: str,
+        video_url: str,
+        caption: str,
+    ) -> str:
+        """Publish an Instagram Reel. Returns the permalink on success.
+
+        Dry-run mode logs the intended publish and returns an empty
+        string without hitting the API. Any :class:`reels.ReelsError`
+        during container creation, polling, or publish is allowed to
+        propagate — callers in the manual publish path rely on this
+        for ``FAILED`` status reporting, while the
+        POST_RENDER wrapper catches and logs them.
+        """
         if self._config.get("dry_run"):
             log.info(
                 "Meta plugin: [DRY RUN] would publish Reel — "
@@ -396,49 +677,38 @@ class MetaPlugin:
                 caption,
                 video_url,
             )
-            return
+            return ""
 
-        try:
-            container = reels.create_reel_container(
-                ig_user_id=ig_user_id,
-                access_token=access_token,
-                video_url=video_url,
-                caption=caption,
-                share_to_feed=self._config.get("reel_share_to_feed", True),
-                thumb_offset=self._config.get("reel_thumb_offset_ms", 0),
-                api_version=api_version,
-            )
-        except reels.ReelsError as exc:
-            log.warning("Meta plugin: Reel container creation failed: %s", exc)
-            return
+        container = reels.create_reel_container(
+            ig_user_id=ig_user_id,
+            access_token=access_token,
+            video_url=video_url,
+            caption=caption,
+            share_to_feed=self._config.get("reel_share_to_feed", True),
+            thumb_offset=self._config.get("reel_thumb_offset_ms", 0),
+            api_version=api_version,
+        )
 
-        try:
-            reels.poll_container_status(
-                container_id=container.container_id,
-                access_token=access_token,
-                api_version=api_version,
-                max_attempts=self._config.get("reel_poll_max_attempts", 60),
-                poll_interval=float(
-                    self._config.get("reel_poll_interval_seconds", 5)
-                ),
-            )
-        except reels.ReelsError as exc:
-            log.warning("Meta plugin: Reel container polling failed: %s", exc)
-            return
+        reels.poll_container_status(
+            container_id=container.container_id,
+            access_token=access_token,
+            api_version=api_version,
+            max_attempts=self._config.get("reel_poll_max_attempts", 60),
+            poll_interval=float(
+                self._config.get("reel_poll_interval_seconds", 5)
+            ),
+        )
 
-        try:
-            media_id = reels.publish_reel(
-                ig_user_id=ig_user_id,
-                access_token=access_token,
-                container_id=container.container_id,
-                api_version=api_version,
-            )
-        except reels.ReelsError as exc:
-            log.warning("Meta plugin: Reel publish failed: %s", exc)
-            return
+        media_id = reels.publish_reel(
+            ig_user_id=ig_user_id,
+            access_token=access_token,
+            container_id=container.container_id,
+            api_version=api_version,
+        )
 
         self._published_reel_id = media_id
 
+        # Permalink retrieval is non-fatal — log and return empty on failure.
         permalink = ""
         try:
             permalink = reels.get_permalink(
@@ -447,15 +717,17 @@ class MetaPlugin:
                 api_version=api_version,
             )
         except reels.ReelsError as exc:
-            log.warning("Meta plugin: permalink retrieval failed (non-fatal): %s", exc)
+            log.warning(
+                "Meta plugin: permalink retrieval failed (non-fatal): %s",
+                exc,
+            )
 
-        context.shared["reels"] = context.shared.get("reels", {})
-        context.shared["reels"]["meta"] = permalink
         log.info(
             "Meta plugin: published Reel media_id=%s permalink=%s",
             media_id,
             permalink,
         )
+        return permalink
 
     def _post_comment(self, access_token: str, api_version: str) -> None:
         """Post a comment on the last published Reel."""
@@ -496,7 +768,14 @@ class MetaPlugin:
         access_token: str,
         api_version: str,
     ) -> None:
-        """Execute the full Facebook Reel publishing flow."""
+        """Execute the full Facebook Reel publishing flow (POST_RENDER wrapper).
+
+        Thin wrapper around :meth:`_do_fb_reel_publish` that reads
+        ``video_url`` from ``context.shared``, swallows
+        :class:`facebook_reels.FacebookReelsError` on any step so a
+        publish failure never breaks the render pipeline, and writes
+        the published video_id into ``context.shared["facebook_reels"]``.
+        """
         video_url = context.shared.get("video_url", "")
         if not video_url:
             log.warning(
@@ -512,6 +791,40 @@ class MetaPlugin:
         title = self._build_facebook_reel_title(context)
         description = self._build_facebook_reel_description(context)
 
+        try:
+            video_id = self._do_fb_reel_publish(
+                page_id=page_id,
+                access_token=access_token,
+                api_version=api_version,
+                video_url=str(video_url),
+                title=title,
+                description=description,
+            )
+        except facebook_reels.FacebookReelsError as exc:
+            log.warning("Meta plugin: Facebook Reel publish failed: %s", exc)
+            return
+
+        context.shared["facebook_reels"] = context.shared.get("facebook_reels", {})
+        context.shared["facebook_reels"]["meta"] = video_id
+
+    def _do_fb_reel_publish(
+        self,
+        *,
+        page_id: str,
+        access_token: str,
+        api_version: str,
+        video_url: str,
+        title: str,
+        description: str,
+    ) -> str:
+        """Publish a Facebook Reel. Returns the video_id on success.
+
+        Dry-run mode logs the intended publish and returns an empty
+        string without hitting the API. Errors from any stage
+        (start, upload, finish, poll) propagate as
+        :class:`facebook_reels.FacebookReelsError` so callers in the
+        manual publish path can map them to ``FAILED`` status.
+        """
         if self._config.get("dry_run"):
             log.info(
                 "Meta plugin: [DRY RUN] would publish Facebook Reel — "
@@ -520,61 +833,44 @@ class MetaPlugin:
                 title,
                 video_url,
             )
-            return
+            return ""
 
-        try:
-            start = facebook_reels.start_reel_upload(
-                page_id=page_id,
-                access_token=access_token,
-                api_version=api_version,
-            )
-        except facebook_reels.FacebookReelsError as exc:
-            log.warning("Meta plugin: Facebook Reel start failed: %s", exc)
-            return
+        start = facebook_reels.start_reel_upload(
+            page_id=page_id,
+            access_token=access_token,
+            api_version=api_version,
+        )
 
-        try:
-            facebook_reels.upload_reel_video(
-                upload_url=start.upload_url,
-                access_token=access_token,
-                video_url=str(video_url),
-            )
-        except facebook_reels.FacebookReelsError as exc:
-            log.warning("Meta plugin: Facebook Reel upload failed: %s", exc)
-            return
+        facebook_reels.upload_reel_video(
+            upload_url=start.upload_url,
+            access_token=access_token,
+            video_url=video_url,
+        )
 
-        try:
-            facebook_reels.finish_reel(
-                page_id=page_id,
-                access_token=access_token,
-                video_id=start.video_id,
-                title=title,
-                description=description,
-                api_version=api_version,
-            )
-        except facebook_reels.FacebookReelsError as exc:
-            log.warning("Meta plugin: Facebook Reel publish failed: %s", exc)
-            return
+        facebook_reels.finish_reel(
+            page_id=page_id,
+            access_token=access_token,
+            video_id=start.video_id,
+            title=title,
+            description=description,
+            api_version=api_version,
+        )
 
-        try:
-            facebook_reels.poll_reel_status(
-                video_id=start.video_id,
-                access_token=access_token,
-                api_version=api_version,
-                max_attempts=self._config.get("reel_poll_max_attempts", 60),
-                poll_interval=float(
-                    self._config.get("reel_poll_interval_seconds", 5)
-                ),
-            )
-        except facebook_reels.FacebookReelsError as exc:
-            log.warning("Meta plugin: Facebook Reel polling failed: %s", exc)
-            return
+        facebook_reels.poll_reel_status(
+            video_id=start.video_id,
+            access_token=access_token,
+            api_version=api_version,
+            max_attempts=self._config.get("reel_poll_max_attempts", 60),
+            poll_interval=float(
+                self._config.get("reel_poll_interval_seconds", 5)
+            ),
+        )
 
-        context.shared["facebook_reels"] = context.shared.get("facebook_reels", {})
-        context.shared["facebook_reels"]["meta"] = start.video_id
         log.info(
             "Meta plugin: published Facebook Reel video_id=%s",
             start.video_id,
         )
+        return start.video_id
 
     def _build_facebook_reel_title(self, context: HookContext) -> str:
         """Build a Facebook Reel title from render metadata or game info.
