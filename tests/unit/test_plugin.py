@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from reeln.plugins.hooks import Hook, HookContext
@@ -1358,7 +1358,11 @@ class TestOnPostRenderReels:
         ):
             plugin.on_post_render(context)
 
-        assert "Reel container creation failed" in caplog.text
+        # _do_ig_reel_publish lets the ReelsError propagate; the wrapper
+        # catches it and logs a single consolidated "Reel publish failed"
+        # message with the underlying exception text.
+        assert "Reel publish failed" in caplog.text
+        assert "api error" in caplog.text
         assert plugin._published_reel_id is None
 
     def test_polling_failure(
@@ -1384,7 +1388,8 @@ class TestOnPostRenderReels:
         ):
             plugin.on_post_render(context)
 
-        assert "Reel container polling failed" in caplog.text
+        assert "Reel publish failed" in caplog.text
+        assert "timed out" in caplog.text
 
     def test_publish_failure(
         self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture
@@ -2070,7 +2075,10 @@ class TestOnPostRenderFacebookReels:
         ):
             plugin.on_post_render(context)
 
-        assert "Facebook Reel start failed" in caplog.text
+        # _do_fb_reel_publish lets the FacebookReelsError propagate; the
+        # wrapper catches it with a single consolidated log message.
+        assert "Facebook Reel publish failed" in caplog.text
+        assert "start failed" in caplog.text
         assert "facebook_reels" not in context.shared
 
     def test_upload_failure(
@@ -2096,7 +2104,8 @@ class TestOnPostRenderFacebookReels:
         ):
             plugin.on_post_render(context)
 
-        assert "Facebook Reel upload failed" in caplog.text
+        assert "Facebook Reel publish failed" in caplog.text
+        assert "upload failed" in caplog.text
 
     def test_finish_failure(
         self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
@@ -2149,7 +2158,8 @@ class TestOnPostRenderFacebookReels:
         ):
             plugin.on_post_render(context)
 
-        assert "Facebook Reel polling failed" in caplog.text
+        assert "Facebook Reel publish failed" in caplog.text
+        assert "poll timeout" in caplog.text
 
     def test_dry_run(
         self, plugin_config: dict[str, Any], caplog: pytest.LogCaptureFixture,
@@ -2394,3 +2404,681 @@ class TestBuildFacebookReelDescription:
             shared={"render_metadata": {"title": "T", "description": ""}},
         )
         assert plugin._build_facebook_reel_description(context) == "Go Eagles!"
+
+
+# ------------------------------------------------------------------
+# upload() — Uploader protocol for manual publish (reeln queue publish)
+# ------------------------------------------------------------------
+
+
+_CDN_URL = "https://cdn.example.com/clip.mp4"
+
+
+def _make_meta_plugin(plugin_config: dict[str, Any], **overrides: Any) -> MetaPlugin:
+    """Build a MetaPlugin with publishable defaults and test-stubbed auth."""
+    cfg = dict(plugin_config)
+    cfg.update(
+        {
+            "publish_reels": True,
+            "instagram_account_id": "ig-456",
+            "page_id": "pg-123",
+            "reel_caption_template": "",
+            "facebook_reel_description_template": "",
+        }
+    )
+    cfg.update(overrides)
+    plugin = MetaPlugin(cfg)
+    plugin._access_token = "test-access-token-123"
+    return plugin
+
+
+class TestUpload:
+    """Tests for the ``upload()`` method used by ``reeln queue publish``.
+
+    Meta is unusual among uploaders: it doesn't upload raw files — it
+    publishes Reels from a pre-existing hosted URL that upstream
+    uploaders (cloudflare) wrote into ``metadata["video_url"]``. The
+    ``path`` arg is accepted to satisfy the protocol but ignored.
+    """
+
+    def test_upload_no_flags_raises_skipped(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        # plugin_config has no publish flags enabled
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = MetaPlugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="no meta publishing flags"):
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_missing_video_url_raises_skipped(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="video_url"):
+            plugin.upload(video, metadata={})
+
+    def test_upload_missing_video_url_comment_only_does_not_raise(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When only post_instagram_comment is enabled (no publish), no
+        video_url is required because comments don't need one."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            publish_reels=False,
+            publish_facebook_reels=False,
+            post_instagram_comment=True,
+        )
+        plugin._published_reel_id = None  # no existing reel to comment on
+
+        # No video_url, no reel to comment on — primary_url stays empty and
+        # upload returns the sentinel without error.
+        url = plugin.upload(video, metadata={})
+        assert "meta:" in url
+
+    def test_upload_auth_failure_raises_runtime_error(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+        plugin._access_token = None
+
+        with patch(
+            "reeln_meta_plugin.plugin.auth.read_token",
+            side_effect=AuthError("bad token"),
+        ):
+            with pytest.raises(RuntimeError, match="authentication"):
+                plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_ig_missing_account_id_raises(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, instagram_account_id="")
+
+        with pytest.raises(RuntimeError, match="instagram_account_id"):
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_fb_missing_page_id_raises(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            publish_reels=False,
+            publish_facebook_reels=True,
+            page_id="",
+        )
+
+        with pytest.raises(RuntimeError, match="page_id"):
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_ig_reel_success_returns_permalink(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+        ):
+            url = plugin.upload(
+                video,
+                metadata={
+                    "video_url": _CDN_URL,
+                    "title": "Goal!",
+                    "description": "What a shot",
+                    "home_team": "Eagles",
+                    "away_team": "Hawks",
+                },
+            )
+
+        assert url == "https://instagram.com/reel/abc"
+        assert plugin._published_reel_id == "media-abc"
+
+    def test_upload_ig_reel_error_when_only_target_propagates_as_runtime_error(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When IG is the ONLY publish target and it fails, the overall
+        upload fails with a RuntimeError wrapping the IG error. The raw
+        ReelsError is collected per-sub-operation, not propagated."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+
+        with patch(
+            "reeln_meta_plugin.plugin.reels.create_reel_container",
+            side_effect=ReelsError("container failed"),
+        ):
+            with pytest.raises(RuntimeError, match="IG Reel.*container failed"):
+                plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_ig_reel_dry_run_returns_sentinel(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, dry_run=True)
+
+        with patch(
+            "reeln_meta_plugin.plugin.reels.create_reel_container"
+        ) as mock_create:
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        assert url == "meta:dry_run"
+        mock_create.assert_not_called()
+
+    def test_upload_fb_reel_success_returns_url(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            publish_reels=False,
+            publish_facebook_reels=True,
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status"),
+        ):
+            url = plugin.upload(
+                video,
+                metadata={
+                    "video_url": _CDN_URL,
+                    "title": "Goal!",
+                    "description": "Description",
+                },
+            )
+
+        assert "facebook.com/pg-123/videos/fb-vid-123" in url
+
+    def test_upload_fb_reel_error_when_only_target_propagates_as_runtime_error(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When FB is the ONLY publish target and it fails, the overall
+        upload fails with a RuntimeError wrapping the FB error."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            publish_reels=False,
+            publish_facebook_reels=True,
+        )
+
+        with patch(
+            "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+            side_effect=FacebookReelsError("start failed"),
+        ):
+            with pytest.raises(
+                RuntimeError, match="Facebook Reel.*start failed"
+            ):
+                plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+    def test_upload_ig_and_fb_prefers_ig_permalink(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, publish_facebook_reels=True)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status"),
+        ):
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        assert url == "https://instagram.com/reel/abc"
+
+    def test_upload_comment_success(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            post_instagram_comment=True,
+            instagram_comment_template="Go {home_team}!",
+        )
+        plugin._published_reel_id = "media-xyz"
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.comments.post_comment",
+                return_value=MagicMock(comment_id="c-1"),
+            ) as mock_comment,
+        ):
+            plugin.upload(
+                video,
+                metadata={
+                    "video_url": _CDN_URL,
+                    "home_team": "Eagles",
+                    "away_team": "Hawks",
+                },
+            )
+
+        mock_comment.assert_called_once()
+
+    def test_upload_comment_failure_non_fatal(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            post_instagram_comment=True,
+            instagram_comment_template="Go {home_team}!",
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.comments.post_comment",
+                side_effect=CommentError("blocked"),
+            ),
+        ):
+            # Comment failure must not prevent the overall publish from
+            # succeeding — the Reel itself went up.
+            url = plugin.upload(
+                video,
+                metadata={
+                    "video_url": _CDN_URL,
+                    "home_team": "Eagles",
+                    "away_team": "Hawks",
+                },
+            )
+
+        assert url == "https://instagram.com/reel/abc"
+
+    def test_upload_hydrates_game_info_from_metadata(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When _game_info is None (manual publish path), the helper
+        populates it from the metadata dict so template rendering works."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            reel_caption_template="Match: {home_team} vs {away_team}",
+        )
+        assert plugin._game_info is None
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ) as mock_create,
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+        ):
+            plugin.upload(
+                video,
+                metadata={
+                    "video_url": _CDN_URL,
+                    "home_team": "Eagles",
+                    "away_team": "Hawks",
+                    "date": "2026-01-15",
+                    "sport": "hockey",
+                },
+            )
+
+        # _game_info was hydrated from metadata
+        assert plugin._game_info is not None
+        # And the caption was rendered from the template with hydrated values
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["caption"] == "Match: Eagles vs Hawks"
+
+    def test_upload_hydrate_noop_when_game_info_already_set(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+        existing = FakeGameInfo(home_team="Existing", away_team="Teams")
+        plugin._game_info = existing
+
+        plugin._hydrate_game_info_from_metadata({"home_team": "Other"})
+
+        assert plugin._game_info is existing
+
+    def test_upload_hydrate_noop_when_metadata_empty(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        plugin._hydrate_game_info_from_metadata({})
+        assert plugin._game_info is None
+
+    def test_upload_caption_prefers_description(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(
+            plugin_config,
+            reel_caption_template="Template: {home_team}",
+        )
+        caption = plugin._build_caption_from_metadata(
+            {"description": "AI-generated", "home_team": "Eagles"}
+        )
+        assert caption == "AI-generated"
+
+    def test_upload_caption_falls_to_template(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(
+            plugin_config,
+            reel_caption_template="Go {home_team}!",
+        )
+        plugin._hydrate_game_info_from_metadata({"home_team": "Eagles"})
+        caption = plugin._build_caption_from_metadata({"home_team": "Eagles"})
+        assert caption == "Go Eagles!"
+
+    def test_upload_caption_falls_to_title_when_no_template(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        plugin._game_info = FakeGameInfo(
+            home_team="Eagles", away_team="Hawks", date="2026-01-15"
+        )
+        caption = plugin._build_caption_from_metadata({})
+        assert "Eagles" in caption and "Hawks" in caption
+
+    def test_upload_caption_empty_when_nothing_available(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        # No _game_info, no template, no description
+        caption = plugin._build_caption_from_metadata({})
+        assert caption == ""
+
+    def test_upload_fb_title_from_metadata(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        title = plugin._build_fb_title_from_metadata({"title": "Custom Title"})
+        assert title == "Custom Title"
+
+    def test_upload_fb_title_fallback_to_game_info(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        plugin._game_info = FakeGameInfo(
+            home_team="Eagles", away_team="Hawks", date="2026-01-15"
+        )
+        title = plugin._build_fb_title_from_metadata({})
+        assert "Eagles" in title
+
+    def test_upload_fb_title_empty_when_nothing_available(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        assert plugin._build_fb_title_from_metadata({}) == ""
+
+    def test_upload_fb_description_from_metadata(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        desc = plugin._build_fb_description_from_metadata(
+            {"description": "Big game"}
+        )
+        assert desc == "Big game"
+
+    def test_upload_fb_description_falls_to_template(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(
+            plugin_config,
+            facebook_reel_description_template="Watch {home_team} highlights",
+        )
+        plugin._hydrate_game_info_from_metadata({"home_team": "Eagles"})
+        desc = plugin._build_fb_description_from_metadata({})
+        assert desc == "Watch Eagles highlights"
+
+    def test_upload_fb_description_empty_when_nothing_available(
+        self, plugin_config: dict[str, Any]
+    ) -> None:
+        plugin = _make_meta_plugin(plugin_config)
+        assert plugin._build_fb_description_from_metadata({}) == ""
+
+    def test_upload_accepts_no_metadata(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """metadata=None is valid per the Uploader protocol."""
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+
+        # Without metadata, video_url is missing → UploaderSkipped.
+        with pytest.raises(UploaderSkipped, match="video_url"):
+            plugin.upload(video)
+
+    def test_upload_ig_succeeds_fb_fails_returns_ig_permalink(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """REGRESSION: IG publishes successfully, FB fails → upload()
+        must return the IG permalink, NOT raise. Otherwise the dock
+        marks meta as FAILED, the user clicks Retry, and the plugin
+        publishes ANOTHER live IG Reel on every retry.
+
+        This was a real production bug that caused multiple duplicate
+        Instagram Reels before it was fixed.
+        """
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, publish_facebook_reels=True)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                side_effect=FacebookReelsError("FB fetch blocked"),
+            ),
+        ):
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        # IG permalink returned — publish_queue_item records PUBLISHED.
+        assert url == "https://instagram.com/reel/abc"
+        # And _published_reel_id is set (for subsequent comment posting).
+        assert plugin._published_reel_id == "media-abc"
+
+    def test_upload_ig_fails_fb_succeeds_returns_fb_url(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """Mirror of the IG-wins case: when IG fails but FB succeeds,
+        return the FB video URL instead of raising."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, publish_facebook_reels=True)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                side_effect=ReelsError("IG container failed"),
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status"),
+        ):
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        assert "facebook.com/pg-123/videos/fb-vid-123" in url
+
+    def test_upload_both_ig_and_fb_fail_raises_combined_errors(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When BOTH publishes fail, raise with both errors in the message."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config, publish_facebook_reels=True)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                side_effect=ReelsError("IG container failed"),
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                side_effect=FacebookReelsError("FB start failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError) as excinfo:
+                plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        # Both sub-op errors should be in the composite message.
+        assert "IG Reel" in str(excinfo.value)
+        assert "IG container failed" in str(excinfo.value)
+        assert "Facebook Reel" in str(excinfo.value)
+        assert "FB start failed" in str(excinfo.value)
+
+    def test_upload_partial_missing_config_with_other_target_succeeding(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """Missing IG account id + FB succeeds → return FB URL, don't raise."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            publish_facebook_reels=True,
+            instagram_account_id="",  # misconfigured → errors, but FB saves us
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
+                return_value=_FAKE_FB_START,
+            ),
+            patch("reeln_meta_plugin.plugin.facebook_reels.upload_reel_video"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.finish_reel"),
+            patch("reeln_meta_plugin.plugin.facebook_reels.poll_reel_status"),
+        ):
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        assert "facebook.com" in url
+
+    def test_upload_ig_publish_non_fatal_empty_permalink(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """Empty permalink (from _do_ig_reel_publish) still produces a
+        successful return — primary_url falls back to the sentinel."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(plugin_config)
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                side_effect=ReelsError("permalink lookup down"),
+            ),
+        ):
+            url = plugin.upload(video, metadata={"video_url": _CDN_URL})
+
+        # get_permalink failure is caught inside _do_ig_reel_publish and
+        # produces an empty permalink. Overall upload returns the sentinel.
+        assert url == "meta:published"
