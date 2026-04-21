@@ -11,6 +11,7 @@ import pytest
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
+from reeln_meta_plugin import __version__
 from reeln_meta_plugin.auth import AuthError
 from reeln_meta_plugin.comments import CommentError, CommentResult
 from reeln_meta_plugin.facebook_reels import FacebookReelsError, ReelStartResult
@@ -27,7 +28,7 @@ class TestMetaPluginAttributes:
 
     def test_version(self) -> None:
         plugin = MetaPlugin()
-        assert plugin.version == "0.10.0"
+        assert plugin.version == __version__
 
     def test_api_version(self) -> None:
         plugin = MetaPlugin()
