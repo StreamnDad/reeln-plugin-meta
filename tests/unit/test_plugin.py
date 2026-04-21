@@ -2497,9 +2497,8 @@ class TestUpload:
         with patch(
             "reeln_meta_plugin.plugin.auth.read_token",
             side_effect=AuthError("bad token"),
-        ):
-            with pytest.raises(RuntimeError, match="authentication"):
-                plugin.upload(video, metadata={"video_url": _CDN_URL})
+        ), pytest.raises(RuntimeError, match="authentication"):
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
 
     def test_upload_ig_missing_account_id_raises(
         self, plugin_config: dict[str, Any], tmp_path: Path
@@ -2575,9 +2574,8 @@ class TestUpload:
         with patch(
             "reeln_meta_plugin.plugin.reels.create_reel_container",
             side_effect=ReelsError("container failed"),
-        ):
-            with pytest.raises(RuntimeError, match="IG Reel.*container failed"):
-                plugin.upload(video, metadata={"video_url": _CDN_URL})
+        ), pytest.raises(RuntimeError, match=r"IG Reel.*container failed"):
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
 
     def test_upload_ig_reel_dry_run_returns_sentinel(
         self, plugin_config: dict[str, Any], tmp_path: Path
@@ -2641,11 +2639,10 @@ class TestUpload:
         with patch(
             "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
             side_effect=FacebookReelsError("start failed"),
+        ), pytest.raises(
+            RuntimeError, match=r"Facebook Reel.*start failed"
         ):
-            with pytest.raises(
-                RuntimeError, match="Facebook Reel.*start failed"
-            ):
-                plugin.upload(video, metadata={"video_url": _CDN_URL})
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
 
     def test_upload_ig_and_fb_prefers_ig_permalink(
         self, plugin_config: dict[str, Any], tmp_path: Path
@@ -3017,10 +3014,9 @@ class TestUpload:
             patch(
                 "reeln_meta_plugin.plugin.facebook_reels.start_reel_upload",
                 side_effect=FacebookReelsError("FB start failed"),
-            ),
+            ),pytest.raises(RuntimeError) as excinfo
         ):
-            with pytest.raises(RuntimeError) as excinfo:
-                plugin.upload(video, metadata={"video_url": _CDN_URL})
+            plugin.upload(video, metadata={"video_url": _CDN_URL})
 
         # Both sub-op errors should be in the composite message.
         assert "IG Reel" in str(excinfo.value)
