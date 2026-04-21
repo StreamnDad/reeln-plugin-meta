@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.11.0] - 2026-04-20
+
+### Added
+
+- Scheduled publish support with scheduled_at timestamps
+- Regenerate image guard — skip on_game_init when `regenerate_image_only` is set
+- Game state boundary documentation in CLAUDE.md
+
 ## [0.10.0] - 2026-04-07
 
 ### Added
