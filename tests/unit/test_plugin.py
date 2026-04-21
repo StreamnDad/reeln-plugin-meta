@@ -365,6 +365,18 @@ _FAKE_RESULT = LivestreamResult(
 
 
 class TestOnGameInit:
+    def test_regenerate_image_only_skips(self, plugin_config: dict[str, Any]) -> None:
+        """When regenerate_image_only is set, on_game_init returns immediately."""
+        plugin = MetaPlugin(plugin_config)
+        context = HookContext(
+            hook=Hook.ON_GAME_INIT,
+            data={"game_info": FakeGameInfo(), "regenerate_image_only": True},
+        )
+
+        plugin.on_game_init(context)
+
+        assert "livestreams" not in context.shared
+
     def test_disabled_by_default(self) -> None:
         """When create_livestream is not set, on_game_init does nothing."""
         plugin = MetaPlugin({"page_access_token_file": "/tmp/tok", "page_id": "123"})
@@ -1755,6 +1767,41 @@ class TestOnPostRenderBothEnabled:
         mock_comment.assert_not_called()
 
 
+    def test_empty_comment_template_skips_comment(self, plugin_config: dict[str, Any]) -> None:
+        """When comment template is empty, comment is skipped even if flag is enabled."""
+        plugin_config.update({
+            "publish_reels": True,
+            "post_instagram_comment": True,
+            "instagram_account_id": "ig-456",
+            "instagram_comment_template": "",
+        })
+        plugin = MetaPlugin(plugin_config)
+        plugin._access_token = "test-access-token-123"
+        plugin._game_info = FakeGameInfo()
+        context = HookContext(
+            hook=Hook.POST_RENDER,
+            data={},
+            shared={"video_url": "https://cdn.example.com/clip.mp4"},
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status", return_value="FINISHED"),
+            patch("reeln_meta_plugin.plugin.reels.publish_reel", return_value="media-789"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://www.instagram.com/reel/abc/",
+            ),
+            patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment,
+        ):
+            plugin.on_post_render(context)
+
+        mock_comment.assert_not_called()
+
+
 class TestOnPostRenderGameInfoFromHookData:
     def test_caches_game_info_from_hook_data(self, plugin_config: dict[str, Any]) -> None:
         """When create_livestream is disabled, game_info comes from hook data."""
@@ -2761,6 +2808,42 @@ class TestUpload:
             )
 
         assert url == "https://instagram.com/reel/abc"
+
+    def test_upload_empty_comment_template_skips_comment(
+        self, plugin_config: dict[str, Any], tmp_path: Path
+    ) -> None:
+        """When comment template is empty, upload skips comment even if flag is on."""
+        video = tmp_path / "clip.mp4"
+        video.write_text("x")
+        plugin = _make_meta_plugin(
+            plugin_config,
+            post_instagram_comment=True,
+            instagram_comment_template="",
+        )
+
+        with (
+            patch(
+                "reeln_meta_plugin.plugin.reels.create_reel_container",
+                return_value=_FAKE_CONTAINER,
+            ),
+            patch("reeln_meta_plugin.plugin.reels.poll_container_status"),
+            patch(
+                "reeln_meta_plugin.plugin.reels.publish_reel",
+                return_value="media-abc",
+            ),
+            patch(
+                "reeln_meta_plugin.plugin.reels.get_permalink",
+                return_value="https://instagram.com/reel/abc",
+            ),
+            patch("reeln_meta_plugin.plugin.comments.post_comment") as mock_comment,
+        ):
+            url = plugin.upload(
+                video,
+                metadata={"video_url": _CDN_URL},
+            )
+
+        assert url == "https://instagram.com/reel/abc"
+        mock_comment.assert_not_called()
 
     def test_upload_hydrates_game_info_from_metadata(
         self, plugin_config: dict[str, Any], tmp_path: Path
