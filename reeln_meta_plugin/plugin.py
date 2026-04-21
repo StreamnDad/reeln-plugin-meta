@@ -26,7 +26,7 @@ class MetaPlugin:
     """
 
     name: str = "meta"
-    version: str = "0.10.0"
+    version: str = "0.11.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
